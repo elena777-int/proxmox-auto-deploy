@@ -1,5 +1,5 @@
 #!/bin/bash
-MENU_VERSION="0.6.9"   # версия menu.sh; должна совпадать с версией core.sh (SPETSNAZ_VERSION)
+MENU_VERSION="0.7.9"   # версия menu.sh; должна совпадать с версией core.sh (SPETSNAZ_VERSION)
 
 if [ -z "$TMUX" ] && command -v tmux &> /dev/null; then
     tmux has-session -t it_spetsnaz 2>/dev/null
@@ -46,10 +46,35 @@ else
     UI_BACKEND="text"
 fi
 
+# Подогнать размер окна под терминал (большие отчёты не должны ломать whiptail)
+ui_fit() {
+    local h=$1 w=$2 rows cols
+    read -r rows cols < <({ stty size < /dev/tty; } 2>/dev/null)
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=24
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+    [ "$h" -gt $((rows - 1)) ] && h=$((rows - 1))
+    [ "$w" -gt $((cols - 2)) ] && w=$((cols - 2))
+    echo "$h $w"
+}
+# Прокрутка текста в окне нужна, только если текст не помещается. У whiptail с --scrolltext фокус стоит
+# на тексте, и Enter не нажимает кнопку (нужен Tab) — поэтому включаем её лишь для длинных текстов.
+ui_need_scroll() {
+    [ "$UI_BACKEND" = "whiptail" ] || return 1
+    local LC_ALL=C.UTF-8 inner=$(( $3 - 4 )) lines=0 seg
+    [ "$inner" -lt 20 ] && inner=20
+    while IFS= read -r seg; do
+        lines=$(( lines + 1 + ${#seg} / inner ))
+    done < <(printf '%b\n' "$1")
+    [ "$lines" -gt $(( $2 - 7 )) ]
+}
+
 ui_msgbox() {
     local title="$1" text="$2" h="${3:-10}" w="${4:-70}"
+    read -r h w < <(ui_fit "$h" "$w")
+    local sc=()
+    ui_need_scroll "$text" "$h" "$w" && { sc=(--scrolltext); text="(Текст длинный: стрелки — прокрутка, Tab — к кнопке, затем Enter)\n\n$text"; read -r h w < <(ui_fit 100 "$w"); }
     case "$UI_BACKEND" in
-        whiptail|dialog) "$UI_BACKEND" --title "$title" --msgbox "$text" "$h" "$w" ;;
+        whiptail|dialog) "$UI_BACKEND" --title "$title" "${sc[@]}" --msgbox "$text" "$h" "$w" ;;
         text)
             echo -e "\n===== ${title} =====\n${text}\n"
             read -n 1 -s -r -p "Нажмите любую клавишу..."
@@ -60,8 +85,28 @@ ui_msgbox() {
 
 ui_yesno() {
     local title="$1" text="$2" h="${3:-10}" w="${4:-70}"
+    read -r h w < <(ui_fit "$h" "$w")
+    local sc=()
+    ui_need_scroll "$text" "$h" "$w" && { sc=(--scrolltext); text="(Текст длинный: стрелки — прокрутка, Tab — к кнопкам, затем Enter)\n\n$text"; read -r h w < <(ui_fit 100 "$w"); }
     case "$UI_BACKEND" in
-        whiptail|dialog) "$UI_BACKEND" --title "$title" --yesno "$text" "$h" "$w" ;;
+        whiptail|dialog) "$UI_BACKEND" --title "$title" "${sc[@]}" --yesno "$text" "$h" "$w" ;;
+        text)
+            echo -e "\n===== ${title} =====\n${text}"
+            local ans
+            read -r -p "Да/Нет [y/N]: " ans
+            [[ "$ans" =~ ^([YyДд]|[Yy][Ee][Ss])$ ]]
+            ;;
+    esac
+}
+
+# Как ui_yesno, но по умолчанию выбрано «Нет»
+ui_yesno_no() {
+    local title="$1" text="$2" h="${3:-10}" w="${4:-70}"
+    read -r h w < <(ui_fit "$h" "$w")
+    local sc=()
+    ui_need_scroll "$text" "$h" "$w" && { sc=(--scrolltext); text="(Текст длинный: стрелки — прокрутка, Tab — к кнопкам, затем Enter)\n\n$text"; read -r h w < <(ui_fit 100 "$w"); }
+    case "$UI_BACKEND" in
+        whiptail|dialog) "$UI_BACKEND" --title "$title" "${sc[@]}" --defaultno --yesno "$text" "$h" "$w" ;;
         text)
             echo -e "\n===== ${title} =====\n${text}"
             local ans
@@ -107,6 +152,9 @@ ui_pathbox() {
 
 ui_menu() {
     local title="$1" text="$2" h="$3" w="$4" lh="$5"; shift 5
+    read -r h w < <(ui_fit "$h" "$w")
+    [ "$lh" -gt $((h - 7)) ] && lh=$((h - 7))
+    [ "$lh" -lt 1 ] && lh=1
     case "$UI_BACKEND" in
         whiptail|dialog) "$UI_BACKEND" --title "$title" --menu "$text" "$h" "$w" "$lh" "$@" 3>&1 1>&2 2>&3 ;;
         text)
@@ -224,6 +272,71 @@ expand_ranges() {
         fi
     done
     echo "${result[@]}"
+}
+
+# Выбор хранилища для дисков ВМ из списка со свободным местом. $4 — число стендов (тогда отмечается, хватит ли места).
+storage_pick() {
+    local title=$1 text=$2 cur=$3 n=$4 lines id type thin avail tot pct need fits mark args=() first=()
+    lines=$(IMG_DIR="$IMG_DIR" MOD_TYPE="${MOD_TYPE:-DEMO_1}" $CORE_SCRIPT storages $n 2>/dev/null)
+    if [ -z "$lines" ]; then
+        ui_inputbox "$title" "Список хранилищ получить не удалось. Укажите Storage ID вручную (например local-lvm):" 10 75 "$cur"
+        return
+    fi
+    while IFS='|' read -r id type thin avail tot pct need fits; do
+        [ -z "$id" ] && continue
+        mark=""
+        [ "${pct:-0}" -ge 90 ] && mark=" ⚠ заполнено"
+        if [ -n "$n" ]; then
+            [ "$fits" = "1" ] && mark="$mark ✔ хватит" || mark="$mark ✖ мало места"
+        fi
+        local desc
+        desc=$(printf '%-8s %-7s свободно %5s ГБ (занято %s%%)%s' "$type" "$([ "$thin" = 1 ] && echo тонкое || echo толстое)" \
+            "$(awk -v b="$avail" 'BEGIN{printf "%.0f", b/1073741824}')" "$pct" "$mark")
+        if [ "$id" = "$cur" ]; then first=("$id" "$desc"); else args+=("$id" "$desc"); fi
+    done <<< "$lines"
+    args=("${first[@]}" "${args[@]}")
+    ui_menu "$title" "$text" 20 82 $(( ${#args[@]} / 2 )) "${args[@]}"
+}
+
+# Строки «роль: память, ядра» для ролей, у которых в spetsnaz.conf задан RES_<РОЛЬ>
+res_lines() {
+    local r v out=""
+    for r in "$@"; do
+        v="RES_$(echo "$r" | tr 'a-z-' 'A-Z_')"
+        [ -n "${!v}" ] && out+="  $r: ${!v%%:*} МБ, ядер ${!v##*:}\n"
+    done
+    echo -n "$out"
+}
+
+# Предупреждение, если для BR-FW (Ideco NGFW) задано меньше минимума производителя (8 ГБ, 2 ядра)
+res_brfw_warn() {
+    local v=${RES_BR_FW:-}
+    [[ " $* " == *" BR-FW "* ]] || return 0
+    [[ "$v" =~ ^([0-9]+):([0-9]+)$ ]] || return 0
+    if [ "${BASH_REMATCH[1]}" -lt 8192 ] || [ "${BASH_REMATCH[2]}" -lt 2 ]; then
+        echo -n "\n⚠ BR-FW: ${BASH_REMATCH[1]} МБ, ядер ${BASH_REMATCH[2]} — меньше минимума производителя Ideco NGFW (8 ГБ, 2 ядра). На свой риск: сначала проверьте на одном стенде, что Ideco загружается и работает.\n"
+    fi
+}
+
+# Спросить, применять ли RES_* при развёртывании ролей $@; результат — RES_APPLY (0/1)
+res_ask() {
+    local lines
+    lines=$(res_lines "$@")
+    RES_APPLY=0
+    if [ -n "$lines" ] && ui_yesno_no "ПАМЯТЬ И ЯДРА МАШИН" "В spetsnaz.conf заданы значения:\n\n${lines}$(res_brfw_warn "$@")\nПрименить их к разворачиваемым машинам?\n\nНет — память и ядра как в образах. Машины без значения (в том числе HQ-RTR и BR-RTR) не меняются.\nBR-FW (Ideco NGFW) в DEMO_1 не настроен: при уменьшенной памяти его первичная настройка может не пройти." 22 80; then
+        RES_APPLY=1
+    fi
+    export RES_APPLY
+}
+
+# Записать параметр в spetsnaz.conf (заменить строку или добавить)
+conf_set() {
+    local k=$1 v=$2
+    if grep -q "^${k}=" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i "s|^${k}=.*|${k}=\"${v}\"|" "$CONFIG_FILE"
+    else
+        echo "${k}=\"${v}\"" >> "$CONFIG_FILE"
+    fi
 }
 
 # Диалог параметров экспертного доступа (статические IP): сеть, шлюз, DNS.
@@ -374,7 +487,7 @@ provision_sdn_nat_dhcp() {
                 echo -e "${C_YELLOW}Оставляю подсеть $cidr в vnet '$net_id' без изменений — использую как есть, она рабочая.${C_NC}"
             fi
         else
-            if ! ui_yesno "!!! СЕТЬ VNET БУДЕТ ЗАМЕНЕНА !!!" "У vnet '$net_id' уже есть ДРУГАЯ подсеть (см. вывод выше), а вы указали новую: $cidr.\n\nЭто НЕ обновление — ВСЕ остальные подсети этого vnet будут УДАЛЕНЫ (их DHCP-резервации в IPAM пропадут), и вместо них создана новая $cidr.\n\nПродолжить?" 15 74; then
+            if ! ui_yesno_no "!!! СЕТЬ VNET БУДЕТ ЗАМЕНЕНА !!!" "У vnet '$net_id' уже есть ДРУГАЯ подсеть (см. вывод выше), а вы указали новую: $cidr.\n\nЭто НЕ обновление — ВСЕ остальные подсети этого vnet будут УДАЛЕНЫ (их DHCP-резервации в IPAM пропадут), и вместо них создана новая $cidr.\n\nПродолжить?" 15 74; then
                 echo -e "${C_YELLOW}Отменено, ничего не менялось.${C_NC}"
                 return 0
             fi
@@ -775,7 +888,7 @@ else
     IMG_DIR=$(ui_pathbox "ИСТОЧНИК ОБРАЗОВ (BYOI)" "Директория с .vma.zst бэкапами:\n\n💡 Подсказка: Вы можете использовать WinSCP, wget или USB-накопитель, чтобы закинуть сюда свои собственные образы стендов. Главное — сохраните стандартные имена (напр. HQ-SRV.vma.zst)!" "/var/lib/vz/dump" 15 75)
     [ -z "$IMG_DIR" ] && exit 1
 
-    TARGET_STORAGE=$(ui_inputbox "ЦЕЛЕВОЕ ХРАНИЛИЩЕ" "Укажите хранилище для дисков ВМ (Storage ID, например local-lvm):" 10 75 "local-lvm")
+    TARGET_STORAGE=$(storage_pick "КУДА РАЗВОРАЧИВАТЬ МАШИНЫ" "Хранилище Proxmox для дисков машин стендов (не папка с архивами образов — её задали на предыдущем шаге). Перед каждым деплоем место проверяется.\nРекомендуется тонкое хранилище (LVM-thin, ZFS с Thin provision): занимается только записанное." "local-lvm")
     [ -z "$TARGET_STORAGE" ] && exit 1
 
     PROXY_IP=$(ui_inputbox "КЭШИРУЮЩИЙ ПРОКСИ" "IP-адрес APT-кэшера (оставьте пустым, если кэшера нет):" 10 75 "")
@@ -820,7 +933,55 @@ APT_MODE="${APT_MODE:-mirror}"
 APT_CACHE_PORT="${APT_CACHE_PORT:-$([ "$APT_MODE" = proxy ] && echo 3128 || echo 3142)}"
 ADDR_CHECK="${ADDR_CHECK:-1}"
 ADDR_WAIT="${ADDR_WAIT:-150}"
-export ADDR_CHECK ADDR_WAIT
+export ADDR_CHECK ADDR_WAIT SPACE_WARN_PCT EXPORT_ZSTD_LEVEL HQSRV_EXTRA_DISKS
+for _v in $(compgen -v IMG_FROM_); do export "$_v"; done
+
+# Блок памяти/ядер по ролям: дописывается в spetsnaz.conf один раз, значения закомментированы
+# (память и ядра — как в образах, пока эксперт сам не включит строки).
+SPZ_RES_DEFAULTS=('RES_ISP="1024:1"' 'RES_HQ_SRV="1024:1"' 'RES_BR_SRV="1024:1"' 'RES_HQ_CLI="2048:2"' 'RES_BR_FW="8192:2"')
+SPZ_RES_HEAD_072='# Применяются только по согласию: при деплое и переразвёртывании меню спрашивает; для развёрнутых стендов —'
+if [ -f "$CONFIG_FILE" ] && grep -qxF "$SPZ_RES_HEAD_072" "$CONFIG_FILE"; then
+    # блок версии 0.7.2 был активным: убрать его, сохранив значения, изменённые вручную
+    sed -i -e '/^# Память и ядра машин стенда (необязательно)/d' -e "\|^${SPZ_RES_HEAD_072}\$|d" \
+        -e '/^# пункт «Состояние и доступ → Память\/ядра». Значения ниже минимальные; правьте под свой сервер.$/d' \
+        -e '/^# Пустое значение или удалённая строка — память и ядра как в образе.$/d' \
+        -e '/^# HQ-RTR и BR-RTR (EcoRouter) не изменять. BR-FW (Ideco NGFW) в DEMO_1 не настроен: при уменьшенной памяти$/d' \
+        -e '/^# первичная настройка может не пройти (не определяются интерфейсы) — уменьшайте на свой риск.$/d' \
+        -e '/^RES_ISP="1024:1"$/d' -e '/^RES_HQ_SRV="1024:1"$/d' -e '/^RES_BR_SRV="1024:1"$/d' \
+        -e '/^RES_HQ_CLI="2048:2"$/d' -e '/^RES_BR_FW="4096:2"$/d' "$CONFIG_FILE"
+    for _v in $(compgen -v RES_); do unset "$_v"; done
+    source "$CONFIG_FILE"
+fi
+if [ -f "$CONFIG_FILE" ] && ! grep -q 'Память и ядра машин стенда' "$CONFIG_FILE"; then
+    {
+        echo '# Память и ядра машин стенда (необязательно): RES_<РОЛЬ>="ПАМЯТЬ_МБ:ЯДРА", дефисы в имени роли — подчёркивания.'
+        echo '# По умолчанию не заданы: память и ядра — как в образах. Чтобы попробовать меньшие значения, уберите «#»'
+        echo '# перед нужными строками (или: Состояние и доступ → Память/ядра → вписать минимальные значения),'
+        echo '# разверните один стенд и проверьте его работу.'
+        echo '# HQ-RTR и BR-RTR (EcoRouter) не изменять. BR-FW (Ideco NGFW): производитель требует не менее 8 ГБ и 2 ядер.'
+        echo '# Меньшие значения для BR-FW можно вписать здесь — на свой риск (меню предупредит); в DEMO_1 Ideco не настроен,'
+        echo '# и при меньшей памяти первичная настройка может не пройти. Проверьте на одном стенде.'
+        for _kv in "${SPZ_RES_DEFAULTS[@]}"; do grep -q "^${_kv%%=*}=" "$CONFIG_FILE" || echo "#${_kv}"; done
+    } >> "$CONFIG_FILE"
+fi
+
+# Включить минимальные значения RES_* (раскомментировать или дописать строки; заданные вручную не трогаются)
+res_activate_defaults() {
+    local kv k
+    for kv in "${SPZ_RES_DEFAULTS[@]}"; do
+        k=${kv%%=*}
+        if grep -q "^${k}=" "$CONFIG_FILE"; then
+            continue
+        elif grep -q "^#${k}=" "$CONFIG_FILE"; then
+            sed -i "s|^#${k}=|${k}=|" "$CONFIG_FILE"
+        else
+            echo "$kv" >> "$CONFIG_FILE"
+        fi
+    done
+    source "$CONFIG_FILE"
+    for _v in $(compgen -v RES_); do export "$_v"; done
+}
+for _v in $(compgen -v RES_); do export "$_v"; done
 export APT_MODE WAN_BR IMG_DIR TARGET_STORAGE PROXY_IP EXPERT_SUBNET EXPERT_GW EXPERT_DNS EXPERT_IFACE APT_MIRROR_HOST APT_CACHE_PORT
 
 CORE_VERSION=$(grep -m1 -oP 'SPETSNAZ_VERSION="\K[0-9.]+' ./core.sh 2>/dev/null)
@@ -831,7 +992,13 @@ else
     ui_msgbox "РАЗНЫЕ ВЕРСИИ ФАЙЛОВ" "menu.sh имеет версию ${MENU_VERSION}, а core.sh — ${CORE_VERSION:-не найден}.\n\nЭто частая причина странных ошибок: при обновлении нужно заменять ОБА файла (menu.sh и core.sh) и запускать меню заново из этой папки." 12 70
 fi
 
+TARGET_STORAGE_DEFAULT="$TARGET_STORAGE"
+EXPORT_ZSTD_LEVEL_CONF="$EXPORT_ZSTD_LEVEL"
+
 while true; do
+    TARGET_STORAGE="$TARGET_STORAGE_DEFAULT"; export TARGET_STORAGE
+    unset SPACE_FORCE EXPORT_TARGET EXPORT_ROLE RES_APPLY
+    EXPORT_ZSTD_LEVEL="$EXPORT_ZSTD_LEVEL_CONF"; export EXPORT_ZSTD_LEVEL
     MAIN_CAT=$(ui_menu "ИТ-СПЕЦНАЗ ${VERSION_LABEL}: УПРАВЛЕНИЕ ПОЛИГОНОМ (WAN: $WAN_BR / ОС: $HOST_OS)" "Выберите категорию операций:" 15 75 6 \
     "deploy"   "🚀 Развертывание и Настройка (Деплой, Патч)" \
     "power"    "⚡ Питание стендов (Запуск / Остановка)" \
@@ -848,8 +1015,10 @@ while true; do
     ACTION=""
     case "$MAIN_CAT" in
         deploy)
-            ACTION=$(ui_menu "РАЗВЕРТЫВАНИЕ И НАСТРОЙКА" "Выберите операцию:" 13 78 4 \
+            ACTION=$(ui_menu "РАЗВЕРТЫВАНИЕ И НАСТРОЙКА" "Выберите операцию:" 15 80 6 \
             "deploy"    "🚀 Развернуть новые стенды" \
+            "redeploy"  "♻️ Переразвернуть одну машину стенда (из образа)" \
+            "export"    "💾 Сохранить стенд или одну машину как образ(ы)" \
             "patch"     "💉 Накатить инфраструктурный патч (APT/IP)" \
             "aptdirect" "🌐 Отключить кэшер APT (ВМ — напрямую к зеркалу)" \
             "rotate"    "🔑 Ротация паролей (Протокол День С)")
@@ -857,13 +1026,16 @@ while true; do
         power)
             ACTION=$(ui_menu "УПРАВЛЕНИЕ ПИТАНИЕМ" "Выберите операцию:" 16 78 5 \
             "start"    "▶️ Каскадный старт (τ-задержка + проверка адресов)" \
-            "addrchk"  "🔍 Проверить, получили ли адрес внешние интерфейсы" \
             "stop"     "⏹️ Жесткая остановка (Power Off)" \
             "shutdown" "🔌 Мягкое выключение (ACPI Shutdown)" \
-            "reboot"   "🔄 Перезагрузка стендов")
+            "reboot"   "🔄 Перезагрузка стендов" \
+            "addrchk"  "🔍 Проверить, получили ли адрес внешние интерфейсы")
             ;;
         state)
-            ACTION=$(ui_menu "СОСТОЯНИЕ И ДОСТУП" "Выберите операцию:" 20 78 9 \
+            ACTION=$(ui_menu "СОСТОЯНИЕ И ДОСТУП" "Выберите операцию:" 23 80 12 \
+            "space"      "💽 Место, занятое стендами (и свободное на хранилищах)" \
+            "resources"  "🧮 Память/ядра из spetsnaz.conf → развёрнутые стенды" \
+            "iso"        "📀 Подключить диск с доп. материалами (ISO)" \
             "snapshot"   "📷 Создать НОВЫЙ снапшот (Task1, Check2 и т.п.)" \
             "rollback"   "⏪ Откат к снапшоту, напр. Day0 (Внимание!)" \
             "delsnap"    "🗑️ Удалить конкретный снапшот" \
@@ -875,8 +1047,10 @@ while true; do
             "rbperm_off" "🚫 Запретить участникам откат ВМ")
             ;;
         system)
-            ACTION=$(ui_menu "СИСТЕМНЫЕ УТИЛИТЫ" "Выберите операцию:" 12 75 2 \
+            ACTION=$(ui_menu "СИСТЕМНЫЕ УТИЛИТЫ" "Выберите операцию:" 14 80 4 \
             "utils"  "🛠️ Утилиты хоста (apt, OVS, загрузка)" \
+            "storage" "💾 Куда разворачивать машины (хранилище дисков ВМ)" \
+            "imgdir"  "📁 Где лежат архивы образов (.vma.zst)" \
             "reconf" "⚙️ Перенастройка (Сброс spetsnaz.conf)")
             ;;
         danger)
@@ -886,8 +1060,34 @@ while true; do
 
     [ -z "$ACTION" ] && continue
 
+    if [ "$ACTION" == "storage" ]; then
+        NEW_ST=$(storage_pick "КУДА РАЗВОРАЧИВАТЬ МАШИНЫ" "Хранилище Proxmox, на котором создаются диски машин при развёртывании стендов. Сейчас: $TARGET_STORAGE.\nАрхивы образов (.vma.zst) лежат отдельно, в папке $IMG_DIR — её меняет пункт «Где лежат архивы образов»." "$TARGET_STORAGE")
+        if [ -n "$NEW_ST" ] && [ "$NEW_ST" != "$TARGET_STORAGE" ]; then
+            TARGET_STORAGE="$NEW_ST"; TARGET_STORAGE_DEFAULT="$NEW_ST"; export TARGET_STORAGE
+            conf_set TARGET_STORAGE "$NEW_ST"
+            ui_msgbox "ХРАНИЛИЩЕ ДИСКОВ ВМ" "Машины новых стендов будут разворачиваться на: $NEW_ST (сохранено в $CONFIG_FILE)." 8 72
+        fi
+        continue
+    fi
+
+    if [ "$ACTION" == "imgdir" ]; then
+        NEW_IMG=$(ui_pathbox "ГДЕ ЛЕЖАТ АРХИВЫ ОБРАЗОВ" "Папка с архивами .vma.zst (внутри — папки модулей DEMO_1, DEMO_2…). Сейчас: $IMG_DIR\nЗагрузка с Яндекс.Диска и флешки кладёт образы сюда; нужно место примерно на размер бандла." "$IMG_DIR")
+        NEW_IMG="${NEW_IMG%/}"
+        if [ -n "$NEW_IMG" ] && [ "$NEW_IMG" != "$IMG_DIR" ]; then
+            if [ ! -d "$NEW_IMG" ]; then
+                ui_yesno "ПАПКИ НЕТ" "Папки $NEW_IMG нет. Создать?" 8 70 && mkdir -p "$NEW_IMG"
+            fi
+            if [ -d "$NEW_IMG" ]; then
+                IMG_DIR="$NEW_IMG"; export IMG_DIR
+                conf_set IMG_DIR "$NEW_IMG"
+                ui_msgbox "АРХИВЫ ОБРАЗОВ" "Папка архивов образов: $NEW_IMG (сохранено в $CONFIG_FILE).\nСвободно: $(df -h --output=avail "$NEW_IMG" | tail -n 1 | tr -d ' ')" 9 72
+            fi
+        fi
+        continue
+    fi
+
     if [ "$ACTION" == "reconf" ]; then
-        if ui_yesno "СБРОС КОНФИГУРАЦИИ" "Вы собираетесь уничтожить текущий файл $CONFIG_FILE.\n\nВсе базовые параметры (WAN-мост, ZFS-хранилище, IP-прокси) будут стерты, а Мастер настройки запустится заново.\n\nПродолжить?" 10 70; then
+        if ui_yesno_no "СБРОС КОНФИГУРАЦИИ" "Вы собираетесь уничтожить текущий файл $CONFIG_FILE.\n\nВсе базовые параметры (WAN-мост, ZFS-хранилище, IP-прокси) будут стерты, а Мастер настройки запустится заново.\n\nПродолжить?" 10 70; then
             rm -f "$CONFIG_FILE"
             echo -e "\nСтарая конфигурация стерта. Инициирую перезагрузку оболочки..."
             sleep 1
@@ -962,48 +1162,117 @@ while true; do
                 fi
                 ;;
             download)
-                YA_URL=$(ui_inputbox "ЗАГРУЗКА ИЗ ЯНДЕКС.ДИСКА" "Введите публичную ссылку на архив (.tar) с Яндекс.Диска\n(вида https://disk.yandex.ru/d/...):" 10 75)
+                YA_URL=$(ui_inputbox "ЗАГРУЗКА ИЗ ЯНДЕКС.ДИСКА" "Введите публичную ссылку на ФАЙЛ архива (.tar) на Яндекс.Диске\n(вида https://disk.yandex.ru/d/...). Ссылка на папку не подойдёт:" 11 78)
+                [ -z "$YA_URL" ] && continue
 
-                if [ -n "$YA_URL" ]; then
-                    SUB_DIR=$(ui_inputbox "СТРУКТУРА ХРАНЕНИЯ" "Укажите имя папки для этого модуля (она будет создана внутри $IMG_DIR):\nНапример: DEMO_1, REG_B, REG_D" 10 75 "DEMO_1")
+                clear
+                echo -e "${C_GREEN}Получаю сведения о файле на Яндекс.Диске...${C_NC}"
+                YA_META=$(curl -s --get --data-urlencode "public_key=$YA_URL" "https://cloud-api.yandex.net/v1/disk/public/resources")
+                YA_TYPE=$(jq -r '.type // empty' <<< "$YA_META" 2>/dev/null)
+                YA_NAME=$(jq -r '.name // empty' <<< "$YA_META" 2>/dev/null)
+                YA_SIZE=$(jq -r '.size // 0' <<< "$YA_META" 2>/dev/null)
+                [[ "$YA_SIZE" =~ ^[0-9]+$ ]] || YA_SIZE=0
+                if [ "$YA_TYPE" = "dir" ]; then
+                    ui_msgbox "ЭТО ССЫЛКА НА ПАПКУ" "Ссылка ведёт на папку «$YA_NAME». Для папки Яндекс отдаёт zip-архив, который скрипт не распакует.\n\nОткройте на Яндекс.Диске сам файл .tar и скопируйте ссылку на него." 11 74
+                    continue
+                fi
+                if [ -z "$YA_TYPE" ]; then
+                    ui_msgbox "ОШИБКА API" "Не удалось получить сведения о файле.\nПроверьте, что ссылка публичная, файл существует и у сервера есть доступ в Интернет." 10 66
+                    continue
+                fi
 
-                    [ -z "$SUB_DIR" ] && continue
+                SUB_DIR=$(ui_inputbox "СТРУКТУРА ХРАНЕНИЯ" "Файл: $YA_NAME ($(awk -v b="$YA_SIZE" 'BEGIN{printf "%.1f", b/1073741824}') ГБ).\nУкажите имя папки модуля (она будет создана внутри $IMG_DIR):\nНапример: DEMO_1, DEMO_2, REG_B" 12 75 "DEMO_1")
+                [ -z "$SUB_DIR" ] && continue
+                TARGET_DIR="$IMG_DIR/$SUB_DIR"
 
-                    TARGET_DIR="$IMG_DIR/$SUB_DIR"
-
-                    if [ -d "$TARGET_DIR" ] && [ -n "$(find "$TARGET_DIR" -maxdepth 2 -type f -name '*.vma.zst' 2>/dev/null | head -n 1)" ]; then
-                        if ! ui_yesno "ПАПКА УЖЕ СОДЕРЖИТ ОБРАЗЫ" "В $TARGET_DIR уже есть образы .vma.zst.\n\nЕсли это комплект ДРУГОГО модуля — новые файлы перезапишут старые с теми же именами, и стенды двух модулей окажутся из одних образов.\n\nВведите другое имя папки (например DEMO_2), если качаете другой модуль.\n\nПродолжить и распаковать в эту папку?" 16 74; then
-                            continue
-                        fi
-                    fi
-
-                    clear
-                    echo -e "${C_GREEN}Обращаюсь к API Яндекс.Диска для получения прямой ссылки...${C_NC}"
-
-                    DIRECT_URL=$(curl -s "https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key=$YA_URL" | jq -r .href)
-
-                    if [ "$DIRECT_URL" == "null" ] || [ -z "$DIRECT_URL" ]; then
-                        ui_msgbox "ОШИБКА API" "Не удалось получить ссылку.\nПроверьте, что ссылка публичная и файл существует на Диске." 10 60
+                if [ -d "$TARGET_DIR" ] && [ -n "$(find "$TARGET_DIR" -maxdepth 2 -type f -name '*.vma.zst' 2>/dev/null | head -n 1)" ]; then
+                    if ! ui_yesno_no "ПАПКА УЖЕ СОДЕРЖИТ ОБРАЗЫ" "В $TARGET_DIR уже есть образы .vma.zst.\n\nЕсли это комплект ДРУГОГО модуля — новые файлы перезапишут старые с теми же именами, и стенды двух модулей окажутся из одних образов.\n\nВведите другое имя папки (например DEMO_2), если качаете другой модуль.\n\nПродолжить и распаковать в эту папку?" 16 74; then
                         continue
                     fi
+                fi
+                mkdir -p "$TARGET_DIR" || { ui_msgbox "ОШИБКА" "Не удалось создать папку $TARGET_DIR." 8 60; continue; }
 
-                    echo -e "${C_GREEN}Телеметрия получена. Начинаю загрузку боекомплекта...${C_NC}"
-                    TEMP_ARCH="/tmp/spetsnaz_bundle.tar"
+                # прежние версии качали во /tmp — убрать оставшийся файл
+                [ -f /tmp/spetsnaz_bundle.tar ] && rm -f /tmp/spetsnaz_bundle.tar && echo "Удалён старый недокачанный файл /tmp/spetsnaz_bundle.tar"
 
-                    wget --show-progress -O "$TEMP_ARCH" "$DIRECT_URL"
-
-                    if [ -f "$TEMP_ARCH" ]; then
-                        echo -e "${C_GREEN}Распаковываю боекомплект в $TARGET_DIR...${C_NC}"
-
-                        mkdir -p "$TARGET_DIR"
-
-                        tar -xvf "$TEMP_ARCH" -C "$TARGET_DIR"
-                        rm -f "$TEMP_ARCH"
-
-                        ui_msgbox "УСПЕХ" "Боекомплект успешно загружен и аккуратно распакован в $TARGET_DIR!\n\nМожно переходить к Развертыванию стендов." 10 65
+                # Временный файл — в папке образов (тот же раздел, что и распакованные образы)
+                PART="$IMG_DIR/.bundle-download.tar"
+                PART_SIZE=0; [ -f "$PART" ] && PART_SIZE=$(stat -c %s "$PART")
+                if [ "$PART_SIZE" -gt 0 ] && [ "$(cat "$PART.src" 2>/dev/null)" != "$YA_URL" ]; then
+                    rm -f "$PART" "$PART.src"; PART_SIZE=0
+                fi
+                FREE=$(df -B1 --output=avail "$TARGET_DIR" | tail -n 1 | tr -d ' ')
+                gbv() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1073741824}'; }
+                NEED_FILE=$(( YA_SIZE * 2 - PART_SIZE + 1073741824 ))
+                NEED_STREAM=$(( YA_SIZE + 1073741824 ))
+                DL_MODE="file"
+                if [ "$YA_SIZE" -gt 0 ] && [ "$FREE" -lt "$NEED_FILE" ]; then
+                    if [ "$FREE" -ge "$NEED_STREAM" ] && [ "$PART_SIZE" -eq 0 ]; then
+                        if ui_yesno_no "МАЛО МЕСТА ДЛЯ ВРЕМЕННОГО ФАЙЛА" "Свободно в $IMG_DIR: $(gbv "$FREE") ГБ.\nЗагрузка с временным файлом требует ~$(gbv "$NEED_FILE") ГБ (архив + распакованные образы).\n\nМожно распаковывать на лету, без временного файла (~$(gbv "$NEED_STREAM") ГБ), но прерванную загрузку тогда не докачать — только начать заново.\n\nРаспаковывать на лету?" 17 76; then
+                            DL_MODE="stream"
+                        else
+                            continue
+                        fi
                     else
-                        ui_msgbox "ОШИБКА ЗАГРУЗКИ" "Сбой при скачивании файла. Проверьте сетевое соединение." 8 60
+                        ui_msgbox "НЕ ХВАТАЕТ МЕСТА" "Архив: $(gbv "$YA_SIZE") ГБ. Свободно в $IMG_DIR: $(gbv "$FREE") ГБ.\nНужно не меньше ~$(gbv "$NEED_STREAM") ГБ (при распаковке на лету) или ~$(gbv "$NEED_FILE") ГБ (с временным файлом).\n\nОсвободите место, выберите другую папку архивов (Системные утилиты → «Где лежат архивы образов») или скачайте образы по одному." 14 78
+                        continue
                     fi
+                fi
+                if [ "$DL_MODE" = "file" ] && [ "$PART_SIZE" -gt 0 ]; then
+                    if ! ui_yesno "НАЙДЕН НЕДОКАЧАННЫЙ АРХИВ" "Уже скачано $(gbv "$PART_SIZE") из $(gbv "$YA_SIZE") ГБ.\n\nДа — докачать с места обрыва.\nНет — удалить и скачать заново." 12 66; then
+                        rm -f "$PART"; PART_SIZE=0
+                    fi
+                fi
+
+                DIRECT_URL=$(curl -s --get --data-urlencode "public_key=$YA_URL" "https://cloud-api.yandex.net/v1/disk/public/resources/download" | jq -r .href)
+                if [ "$DIRECT_URL" == "null" ] || [ -z "$DIRECT_URL" ]; then
+                    ui_msgbox "ОШИБКА API" "Не удалось получить ссылку на скачивание.\nПроверьте, что ссылка публичная и файл существует на Диске." 10 60
+                    continue
+                fi
+
+                DL_OK=0
+                # распаковка — во временную папку на том же разделе; в папку модуля образы переносятся только целиком
+                INCOMING="$IMG_DIR/.incoming-$$"
+                rm -rf "$INCOMING"; mkdir -p "$INCOMING"
+                if [ "$DL_MODE" = "stream" ]; then
+                    echo -e "${C_GREEN}Скачиваю и распаковываю на лету в $TARGET_DIR...${C_NC}"
+                    echo -e "Если экран консоли перестал обновляться (вкладка браузера была неактивна): Ctrl+B, затем R — перерисовать; загрузка при этом продолжается."
+                    wget -q --show-progress -O - "$DIRECT_URL" | tar -xf - -C "$INCOMING"
+                    PS=("${PIPESTATUS[@]}")
+                    [ "${PS[0]}" -eq 0 ] && [ "${PS[1]}" -eq 0 ] && DL_OK=1
+                    DL_MSG="Загрузка или распаковка прервалась. Начните пункт заново (в этом режиме докачка невозможна)."
+                else
+                    echo "$YA_URL" > "$PART.src"
+                    echo -e "${C_GREEN}Скачиваю в $PART (при обрыве повторите пункт — загрузка продолжится)...${C_NC}"
+                    echo -e "Если экран консоли перестал обновляться (вкладка браузера была неактивна): Ctrl+B, затем R — перерисовать; загрузка при этом продолжается."
+                    wget -c --show-progress -O "$PART" "$DIRECT_URL"; WRC=$?
+                    PART_SIZE=$(stat -c %s "$PART" 2>/dev/null || echo 0)
+                    if [ "$WRC" -ne 0 ] || { [ "$YA_SIZE" -gt 0 ] && [ "$PART_SIZE" -ne "$YA_SIZE" ]; }; then
+                        DL_MSG="Загрузка прервана: скачано $(gbv "$PART_SIZE") из $(gbv "$YA_SIZE") ГБ (код wget $WRC).\nПовторите пункт — загрузка продолжится с места обрыва."
+                    else
+                        echo -e "${C_GREEN}Распаковываю в $TARGET_DIR...${C_NC}"
+                        if tar -xvf "$PART" -C "$INCOMING"; then
+                            DL_OK=1; rm -f "$PART" "$PART.src"
+                        else
+                            DL_MSG="Архив скачан, но распаковка не удалась (повреждён или кончилось место). Архив оставлен: $PART"
+                        fi
+                    fi
+                fi
+
+                # проверка результата: пустые файлы; перенос в папку модуля только при успехе
+                EMPTY=$(find "$INCOMING" -type f -name '*.vma.zst' -empty 2>/dev/null)
+                [ -z "$(find "$INCOMING" -type f -name '*.vma.zst' 2>/dev/null | head -n 1)" ] && [ "$DL_OK" -eq 1 ] && { DL_OK=0; DL_MSG="В архиве нет файлов .vma.zst."; }
+                if [ "$DL_OK" -eq 1 ] && [ -z "$EMPTY" ]; then
+                    find "$INCOMING" -type f -name '*.vma.zst' -exec mv -f {} "$TARGET_DIR/" \;
+                fi
+                rm -rf "$INCOMING"
+                LIST=$(find "$TARGET_DIR" -maxdepth 2 -type f -name '*.vma.zst' -printf '%f  %s\n' 2>/dev/null | awk '{printf "  %-26s %6.1f ГБ\n", $1, $2/1073741824}')
+                if [ "$DL_OK" -eq 1 ] && [ -z "$EMPTY" ]; then
+                    ui_msgbox "УСПЕХ" "Образы загружены в $TARGET_DIR:\n\n$LIST\n\nМожно переходить к развёртыванию стендов." 20 72
+                else
+                    [ -n "$EMPTY" ] && DL_MSG="${DL_MSG:+$DL_MSG\n\n}В архиве пустые образы:\n$(echo "$EMPTY" | sed 's|.*/|  |')"
+                    DL_MSG="$DL_MSG\n\nПапка $TARGET_DIR не изменена."
+                    ui_msgbox "ЗАГРУЗКА НЕ ЗАВЕРШЕНА" "$DL_MSG" 18 78
                 fi
                 ;;
             usb)
@@ -1105,8 +1374,8 @@ while true; do
 
     MOD_TYPE=$(ui_menu "ВЫБОР ЗАДАНИЯ" "Укажите тип экзамена/модуля:" 17 75 7 \
         "DEMO_1" "Демоэкзамен: Задание 1" \
-        "DEMO_2" "Демоэкзамен: Задание 2" \
-        "DEMO_3" "Демоэкзамен: Задание3" \
+        "DEMO_2" "Демоэкзамен: Задания 2 и 3 (общий стенд)" \
+        "DEMO_GOLD" "Демоэкзамен: эталон (выполненные задания, создаёт эксперт)" \
         "REG_B"  "Рег. чемпионат: Модуль Б" \
         "REG_D"  "Рег. чемпионат: Модуль Д" \
         "REG_A"  "Рег. чемпионат: Модуль А" \
@@ -1143,7 +1412,7 @@ while true; do
 
     EXPERT_FLAG=""
     if [ "$ACTION" == "patch" ]; then
-        if ui_yesno "АВТОРИЗАЦИЯ" "Включить 'Экспертный доступ' (статический IP для ISP/GW)?\n\nДа - Для Главного Эксперта.\nНет - Базовый проброс APT." 10 70; then
+        if ui_yesno_no "АВТОРИЗАЦИЯ" "Включить 'Экспертный доступ' (статический IP для ISP/GW)?\n\nДа - Для Главного Эксперта.\nНет - Базовый проброс APT." 10 70; then
             EXPERT_FLAG="--expert-mode"
             expert_net_dialog || { echo -e "${C_YELLOW}Параметры экспертного доступа не заданы — отмена.${C_NC}"; sleep 1; continue; }
         fi
@@ -1165,7 +1434,7 @@ while true; do
         fi
 
         if [ "$ACTION" == "rollback" ]; then
-            if ! ui_yesno "!!! ВНИМАНИЕ: ОПАСНОСТЬ ПОТЕРИ ДАННЫХ !!!" "Вы собираетесь выполнить ОТКАТ (Rollback) стендов [ $STANDS ] к снапшоту: '$SNAP_NAME'.\n\nВсе несохраненные изменения студентов будут БЕЗВОЗВРАТНО УНИЧТОЖЕНЫ.\n\nПродолжить?" 12 70; then
+            if ! ui_yesno_no "!!! ВНИМАНИЕ: ОПАСНОСТЬ ПОТЕРИ ДАННЫХ !!!" "Вы собираетесь выполнить ОТКАТ (Rollback) стендов [ $STANDS ] к снапшоту: '$SNAP_NAME'.\n\nВсе несохраненные изменения студентов будут БЕЗВОЗВРАТНО УНИЧТОЖЕНЫ.\n\nПродолжить?" 12 70; then
                 ui_msgbox "ОТМЕНА ОПЕРАЦИИ" "Защита сработала. Откат отменен, данные в безопасности." 8 60
                 continue
             fi
@@ -1185,27 +1454,58 @@ while true; do
             export SNAP_REPLACE
         elif [ "$ACTION" == "snapshot" ]; then
             SNAP_REPLACE=0
-            ui_yesno "СНАПШОТ '$SNAP_NAME' УЖЕ ЕСТЬ НА МАШИНЕ?" "Если у машины снапшот с именем '$SNAP_NAME' уже существует:\n\nНет — пропустить такую машину (старый снапшот сохранится).\nДа — удалить старый и создать заново (состояние будет записано заново).\n\nПересоздавать существующие снапшоты?" 14 72 && SNAP_REPLACE=1
+            ui_yesno_no "СНАПШОТ '$SNAP_NAME' УЖЕ ЕСТЬ НА МАШИНЕ?" "Если у машины снапшот с именем '$SNAP_NAME' уже существует:\n\nНет — пропустить такую машину (старый снапшот сохранится).\nДа — удалить старый и создать заново (состояние будет записано заново).\n\nПересоздавать существующие снапшоты?" 14 72 && SNAP_REPLACE=1
             export SNAP_REPLACE
         fi
     fi
 
     if [ "$ACTION" == "rbperm_on" ]; then
-        if ! ui_yesno "ОТКАТ ВМ УЧАСТНИКАМИ (ТРЕНИРОВОЧНЫЙ РЕЖИМ)" "Участники стендов [ $STANDS ] смогут сами откатывать СВОИ ВМ к снапшоту (в веб-интерфейсе: ВМ → Snapshots → Rollback).\n\nСоздавать и удалять снапшоты они НЕ смогут.\n\nВАЖНО:\n- только для тренировок, НЕ для демоэкзамена;\n- право привязано к ВМ, а не к имени снапшота: откатиться можно к любому существующему снапшоту (если кроме Day0 есть другие — скрипт предупредит);\n- Day0 хранит состояние на момент развёртывания: настройки патча (APT, IP) после отката пропадут, если Day0 не пересоздан после патча.\n\nВыдать право?" 22 78; then
+        if ! ui_yesno_no "ОТКАТ ВМ УЧАСТНИКАМИ (ТРЕНИРОВОЧНЫЙ РЕЖИМ)" "Участники стендов [ $STANDS ] смогут сами откатывать СВОИ ВМ к снапшоту (в веб-интерфейсе: ВМ → Snapshots → Rollback).\n\nСоздавать и удалять снапшоты они НЕ смогут.\n\nВАЖНО:\n- только для тренировок, НЕ для демоэкзамена;\n- право привязано к ВМ, а не к имени снапшота: откатиться можно к любому существующему снапшоту (если кроме Day0 есть другие — скрипт предупредит);\n- Day0 хранит состояние на момент развёртывания: настройки патча (APT, IP) после отката пропадут, если Day0 не пересоздан после патча.\n\nВыдать право?" 22 78; then
             ui_msgbox "ОТМЕНА ОПЕРАЦИИ" "Права не изменены." 8 50
             continue
         fi
     fi
 
     if [ "$ACTION" == "netperm_on" ]; then
-        if ! ui_yesno "ПРАВО НА ИЗМЕНЕНИЕ СЕТИ ВМ" "Участники стендов [ $STANDS ] смогут менять VLAN-теги и подключения сетевых адаптеров своих ВМ (только на мостах своего стенда, внешний WAN-мост недоступен).\n\nЭто допустимо, только если задание требует настройки коммутации на уровне гипервизора и решение принято Главным экспертом.\n\nВыдать право?" 14 74; then
+        if ! ui_yesno_no "ПРАВО НА ИЗМЕНЕНИЕ СЕТИ ВМ" "Участники стендов [ $STANDS ] смогут менять VLAN-теги и подключения сетевых адаптеров своих ВМ (только на мостах своего стенда, внешний WAN-мост недоступен).\n\nЭто допустимо, только если задание требует настройки коммутации на уровне гипервизора и решение принято Главным экспертом.\n\nВыдать право?" 14 74; then
             ui_msgbox "ОТМЕНА ОПЕРАЦИИ" "Права не изменены." 8 50
             continue
         fi
     fi
 
+    if [ "$ACTION" == "iso" ]; then
+        IFS='|' read -r ISO_NAME ISO_ROLES ISO_VOL <<< "$(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT isoinfo 2>/dev/null)"
+        if [ -z "$ISO_NAME" ]; then
+            ui_msgbox "ДИСК НЕ НУЖЕН" "Модулю $MOD_TYPE диск с дополнительными материалами не нужен (по КИМ — только для Заданий 2 и 3 и для регионального чемпионата)." 10 74
+            continue
+        fi
+        if [ -z "$ISO_VOL" ]; then
+            ui_msgbox "ДИСК НЕ НАЙДЕН" "Файл $ISO_NAME$([ "$ISO_NAME" = "Additional_de.iso" ] && echo " (или Additional.iso)") не найден ни в одном хранилище ISO.\n\nЗагрузите его: сервер → хранилище local → ISO Images → Upload, — и повторите этот пункт." 12 76
+            continue
+        fi
+        if ! ui_yesno "ПОДКЛЮЧИТЬ ДИСК" "Диск $ISO_VOL будет подключён как CD/DVD к машинам: $ISO_ROLES — на стендах [ $STANDS ].\n\n- Включённая машина получит диск сразу, если у неё уже есть привод CD/DVD; иначе — после выключения и включения.\n- Снапшоты, сделанные раньше (в том числе Day0), хранят прежнюю настройку: после отката к ним диск нужно подключить снова.\n\nПодключить?" 17 78; then
+            continue
+        fi
+    fi
+
+    if [ "$ACTION" == "resources" ]; then
+        mapfile -t DEP_ROLES < <(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT roles 2>/dev/null)
+        RES_TXT=$(res_lines "${DEP_ROLES[@]}")
+        if [ -z "$RES_TXT" ]; then
+            if ! ui_yesno_no "ПАМЯТЬ И ЯДРА НЕ ЗАДАНЫ" "В spetsnaz.conf не задано значений RES_<РОЛЬ> для машин модуля $MOD_TYPE: память и ядра — как в образах.\n\nВписать минимальные значения для пробы?\n  ISP, HQ-SRV, BR-SRV: 1024 МБ, 1 ядро\n  HQ-CLI: 2048 МБ, 2 ядра\n  BR-FW (Ideco NGFW): 8192 МБ, 2 ядра (минимум производителя)\nHQ-RTR и BR-RTR (EcoRouter) не меняются.\n\nРекомендуется проверить их на одном стенде; если не подойдут — поправьте или закомментируйте строки в spetsnaz.conf." 20 82; then
+                continue
+            fi
+            res_activate_defaults
+            RES_TXT=$(res_lines "${DEP_ROLES[@]}")
+            [ -z "$RES_TXT" ] && continue
+        fi
+        if ! ui_yesno_no "ПАМЯТЬ И ЯДРА: СТЕНДЫ $STANDS" "Машинам стендов [ $STANDS ] будут заданы значения из spetsnaz.conf:\n\n${RES_TXT}$(res_brfw_warn "${DEP_ROLES[@]}")\nОстальные машины (в том числе HQ-RTR и BR-RTR) не меняются.\n\n- Включённые машины получат новые значения после выключения и включения.\n- Откат к Day0 и другим ранее сделанным снапшотам вернёт прежние значения; чтобы Day0 хранил новые, пересоздайте его (Создать снапшот → Day0 → слово DAY0).\n\nПрименить?" 24 82; then
+            continue
+        fi
+    fi
+
     if [ "$ACTION" == "addrchk" ]; then
-        if ui_yesno "ПРОВЕРКА АДРЕСОВ" "Если у какой-то машины не окажется адреса, попробовать перезапустить на ней сеть (systemctl restart network)?\n\nНе делайте этого, пока участники работают на стендах." 12 70; then
+        if ui_yesno_no "ПРОВЕРКА АДРЕСОВ" "Если у какой-то машины не окажется адреса, попробовать перезапустить на ней сеть (systemctl restart network)?\n\nНе делайте этого, пока участники работают на стендах." 12 70; then
             export ADDR_REPAIR=1
         else
             export ADDR_REPAIR=0
@@ -1235,6 +1535,140 @@ while true; do
                 fi
                 ;;
         esac
+    fi
+
+    if [ "$ACTION" == "redeploy" ]; then
+        mapfile -t RD_ROLES < <(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT roles 2>/dev/null)
+        if [ "${#RD_ROLES[@]}" -eq 0 ]; then
+            ui_msgbox "ПЕРЕРАЗВЁРТЫВАНИЕ" "Не удалось получить список машин модуля $MOD_TYPE." 8 60
+            continue
+        fi
+        RD_ARGS=()
+        for r in "${RD_ROLES[@]}"; do RD_ARGS+=("$r" "машина $r"); done
+        REDEPLOY_ROLE=$(ui_menu "КАКУЮ МАШИНУ ПЕРЕРАЗВЕРНУТЬ" "Модуль $MOD_TYPE, стенды: $STANDS" 22 70 ${#RD_ROLES[@]} "${RD_ARGS[@]}")
+        [ -z "$REDEPLOY_ROLE" ] && continue
+        res_ask "$REDEPLOY_ROLE"
+        CONFIRM_RD=$(ui_inputbox "ПЕРЕРАЗВЁРТЫВАНИЕ $REDEPLOY_ROLE" "На стендах [ $STANDS ] машина $REDEPLOY_ROLE будет удалена вместе со снапшотами и развёрнута заново из образа модуля $MOD_TYPE (как при деплое: сети стенда, VLAN, метки, пул, новый Day0).\n\nВсё, что сделано на этой машине, будет потеряно. Остальные машины стенда не затрагиваются.\n\nДля подтверждения введите слово REDEPLOY:" 16 78)
+        if [ "$CONFIRM_RD" != "REDEPLOY" ]; then
+            ui_msgbox "БЛОКИРОВКА" "Контрольное слово введено неверно. Операция отменена." 8 60
+            continue
+        fi
+        clear
+        REDEPLOY_ROLE="$REDEPLOY_ROLE" $CORE_SCRIPT redeploy $STANDS
+        echo -e "\n---------------------------------------------------"
+        read -n 1 -s -r -p "Операция завершена. Нажми любую клавишу для возврата в меню..."
+        continue
+    fi
+
+    if [ "$ACTION" == "export" ]; then
+        if [ "$(expand_ranges $STANDS | wc -w)" -ne 1 ]; then
+            ui_msgbox "СОХРАНЕНИЕ ОБРАЗОВ" "Укажите ровно один стенд (например: 3)." 8 60
+            continue
+        fi
+        mapfile -t EXP_ROLES < <(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT roles 2>/dev/null)
+        EXP_ARGS=("all" "Все машины стенда (набор целиком)")
+        for r in "${EXP_ROLES[@]}"; do EXP_ARGS+=("$r" "только машина $r"); done
+        EXPORT_ROLE=$(ui_menu "ЧТО СОХРАНИТЬ" "Стенд $STANDS ($MOD_TYPE): весь набор или одну машину?\nПри сохранении одной машины остальные образы в папке не меняются." 22 72 $(( ${#EXP_ARGS[@]} / 2 )) "${EXP_ARGS[@]}")
+        [ -z "$EXPORT_ROLE" ] && continue
+        [ "$EXPORT_ROLE" == "all" ] && EXPORT_ROLE=""
+        EXPORT_TARGET=$(ui_menu "КУДА СОХРАНИТЬ" "Образы будут сохранены в папку модуля внутри $IMG_DIR.\nДеплой этого модуля будет брать образы оттуда:" 19 78 8 \
+            "DEMO_1" "Демоэкзамен: Задание 1" \
+            "DEMO_2" "Демоэкзамен: Задания 2 и 3 (общий стенд)" \
+            "DEMO_GOLD" "Демоэкзамен: эталон (выполненные задания)" \
+            "REG_B"  "Рег. чемпионат: Модуль Б" \
+            "REG_D"  "Рег. чемпионат: Модуль Д" \
+            "REG_A"  "Рег. чемпионат: Модуль А" \
+            "GOLD_B" "Золотой эталон (Модуль Б)" \
+            "custom" "Своё имя папки (архив, эксперименты)")
+        [ -z "$EXPORT_TARGET" ] && continue
+        if [ "$EXPORT_TARGET" == "custom" ]; then
+            EXPORT_TARGET=$(ui_inputbox "ИМЯ ПАПКИ" "Имя папки в $IMG_DIR (латиница, цифры, _ и -):" 10 70 "${MOD_TYPE}_my")
+            if ! [[ "$EXPORT_TARGET" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                ui_msgbox "СОХРАНЕНИЕ ОБРАЗОВ" "Недопустимое имя папки. Операция отменена." 8 60
+                continue
+            fi
+        fi
+        EXP_LVL=$(ui_inputbox "СТЕПЕНЬ СЖАТИЯ" "Уровень сжатия zstd от 1 до 19:\n  3 — быстро (обычный уровень vzdump)\n  10 — компромисс\n  19 — максимальное сжатие, сохранение в разы дольше\nНа скорость распаковки при деплое уровень почти не влияет." 14 72 "${EXPORT_ZSTD_LEVEL:-3}")
+        [ -z "$EXP_LVL" ] && continue
+        if ! [[ "$EXP_LVL" =~ ^[0-9]+$ ]] || [ "$EXP_LVL" -lt 1 ] || [ "$EXP_LVL" -gt 19 ]; then
+            ui_msgbox "СТЕПЕНЬ СЖАТИЯ" "Нужно число от 1 до 19. Операция отменена." 8 60
+            continue
+        fi
+        EXPORT_ZSTD_LEVEL="$EXP_LVL"; export EXPORT_ZSTD_LEVEL
+        if [ -n "$EXPORT_ROLE" ]; then
+            OLD_CNT=$(for n in "$EXPORT_ROLE" "$(case "$EXPORT_ROLE" in PROV-GW) echo PROVIDER-GW;; PROV-SW) echo PROVIDER-SW;; *) echo "$EXPORT_ROLE";; esac)"; do
+                          find "$IMG_DIR/$EXPORT_TARGET" -maxdepth 1 -type f \( -name "${n}${FILE_MASK}" -o -name "${n}-*${FILE_MASK}" -o -name "${n}_*${FILE_MASK}" -o -name "${n}.*${FILE_MASK}" \) 2>/dev/null
+                      done | sort -u | wc -l)
+            EXP_WHAT="Машина $EXPORT_ROLE стенда $STANDS будет сохранена (vzdump) как $EXPORT_ROLE.vma.zst в $IMG_DIR/$EXPORT_TARGET. Остальные образы папки не меняются."
+            EXP_NOTE=""
+            [ "$OLD_CNT" -gt 0 ] && EXP_NOTE="\n\nПрежний образ $EXPORT_ROLE в этой папке после успешного сохранения будет перенесён в $IMG_DIR/_archive/ (не удаляется)."
+        else
+            OLD_CNT=$(find "$IMG_DIR/$EXPORT_TARGET" -maxdepth 1 -type f -name "*${FILE_MASK}" 2>/dev/null | wc -l)
+            EXP_WHAT="Каждая ВМ стенда $STANDS будет сохранена (vzdump) как <РОЛЬ>.vma.zst в $IMG_DIR/$EXPORT_TARGET."
+            EXP_NOTE=""
+            [ "$OLD_CNT" -gt 0 ] && EXP_NOTE="\n\nВ папке $EXPORT_TARGET уже есть образы ($OLD_CNT шт.). После успешного сохранения они будут перенесены в $IMG_DIR/_archive/ (не удаляются)."
+        fi
+        if ! ui_yesno_no "СОХРАНЕНИЕ → $EXPORT_TARGET (сжатие $EXPORT_ZSTD_LEVEL)" "$EXP_WHAT\n\n- Машина останавливается на время копирования и затем запускается снова (если работала).\n- В образ попадает текущее состояние дисков; снапшоты не сохраняются (Day0 у новых стендов создаётся при деплое).\n- Настройки патча (APT через кэшер, экспертный доступ) тоже попадут в образ — при необходимости сначала выполните «Отключить кэшер APT».$EXP_NOTE\n\nПродолжить?" 22 80; then
+            continue
+        fi
+        export EXPORT_ROLE
+        export EXPORT_TARGET
+        clear
+        $CORE_SCRIPT export $STANDS
+        echo -e "\n---------------------------------------------------"
+        read -n 1 -s -r -p "Операция завершена. Нажми любую клавишу для возврата в меню..."
+        continue
+    fi
+
+    if [ "$ACTION" == "deploy" ]; then
+        mapfile -t DEP_ROLES < <(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT roles 2>/dev/null)
+        res_ask "${DEP_ROLES[@]}"
+        IFS='|' read -r ISO_NAME ISO_ROLES ISO_VOL <<< "$(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT isoinfo 2>/dev/null)"
+        if [ -n "$ISO_NAME" ] && [ -z "$ISO_VOL" ]; then
+            ui_yesno "НЕТ ДИСКА С ДОП. МАТЕРИАЛАМИ" "Файл $ISO_NAME$([ "$ISO_NAME" = "Additional_de.iso" ] && echo " (или Additional.iso)") не найден ни в одном хранилище ISO. Без него машины $ISO_ROLES останутся без диска с дополнительными материалами.\n\nДа — развернуть без диска (подключить позже: Состояние и доступ → «Подключить диск с доп. материалами»).\nНет — вернуться в меню: загрузите ISO (хранилище local → ISO Images → Upload) и повторите." 15 78 || continue
+        fi
+        SPACE_N=$(expand_ranges $STANDS | wc -w)
+        DEPLOY_GO=0
+        while true; do
+            clear
+            echo -e "${C_GREEN}Проверяю место на хранилище $TARGET_STORAGE...${C_NC}"
+            SPACE_OUT=$($CORE_SCRIPT spacecheck $STANDS); SPACE_RC=$?
+            SPACE_TXT=$(echo "$SPACE_OUT" | sed 's/\x1b\[[0-9;]*m//g')
+            if echo "$SPACE_TXT" | grep -q "Новых стендов для развёртывания нет"; then
+                ui_msgbox "РАЗВЁРТЫВАНИЕ" "$SPACE_TXT" 12 80
+                break
+            fi
+            if [ "$SPACE_RC" -eq 0 ]; then
+                DEPLOY_GO=1; break
+            elif [ "$SPACE_RC" -eq 1 ]; then
+                ui_yesno_no "ПРОВЕРКА МЕСТА: ЕСТЬ ПРЕДУПРЕЖДЕНИЯ" "$SPACE_TXT\n\nПродолжить развёртывание?" 28 92 && DEPLOY_GO=1
+                break
+            fi
+            ui_msgbox "ПРОВЕРКА МЕСТА: НЕ ХВАТАЕТ" "$SPACE_TXT" 30 92
+            SPACE_ACT=$(ui_menu "НЕ ХВАТАЕТ МЕСТА — РАЗВЁРТЫВАНИЕ ОСТАНОВЛЕНО" "Места на $TARGET_STORAGE не хватает для $SPACE_N стенд(ов) $MOD_TYPE. Что делать?" 13 80 3 \
+                "other"  "💾 Выбрать другое хранилище" \
+                "force"  "⚠️ Развернуть всё равно (ввести слово FORCE)" \
+                "cancel" "↩️ Отмена")
+            case "$SPACE_ACT" in
+                other)
+                    NEW_ST=$(storage_pick "ХРАНИЛИЩЕ ДЛЯ ЭТОГО ДЕПЛОЯ" "Нужное место посчитано на $SPACE_N стенд(ов) $MOD_TYPE:" "$TARGET_STORAGE" "$SPACE_N")
+                    [ -z "$NEW_ST" ] && continue
+                    TARGET_STORAGE="$NEW_ST"; export TARGET_STORAGE
+                    if [ "$NEW_ST" != "$TARGET_STORAGE_DEFAULT" ] && ui_yesno "ХРАНИЛИЩЕ ПО УМОЛЧАНИЮ" "Сделать $NEW_ST хранилищем по умолчанию (записать в $CONFIG_FILE)?\n\nНет — только для этого деплоя." 10 70; then
+                        TARGET_STORAGE_DEFAULT="$NEW_ST"; conf_set TARGET_STORAGE "$NEW_ST"
+                    fi
+                    ;;
+                force)
+                    CONFIRM_F=$(ui_inputbox "РАЗВЁРТЫВАНИЕ БЕЗ МЕСТА" "Если место закончится во время работы, ВМ встанут с ошибкой ввода-вывода (io-error).\nДля подтверждения введите слово FORCE:" 11 74)
+                    if [ "$CONFIRM_F" == "FORCE" ]; then export SPACE_FORCE=1; DEPLOY_GO=1; fi
+                    break
+                    ;;
+                *) break ;;
+            esac
+        done
+        [ "$DEPLOY_GO" -eq 1 ] || continue
+        clear
+        echo -e "${C_GREEN}Инициирую протокол deploy для $MOD_TYPE (Стенды: $STANDS, хранилище: $TARGET_STORAGE)...${C_NC}"
     fi
 
     if [ "$ACTION" == "aptdirect" ]; then
