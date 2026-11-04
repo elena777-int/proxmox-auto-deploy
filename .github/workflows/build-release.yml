@@ -1,0 +1,68 @@
+name: Build and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build and check the executable
+        shell: bash
+        run: |
+          bash scripts/build-release.sh
+          version=$(dist/proxmox-auto-deploy --version)
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME must match v$version"
+            exit 1
+          fi
+
+          # The executable must work in a folder without the source scripts.
+          expected=$(cd "$RUNNER_TEMP" && MOD_TYPE=DEMO_1 bash "$GITHUB_WORKSPACE/core.sh" roles)
+          mkdir "$RUNNER_TEMP/bundle smoke"
+          cp dist/proxmox-auto-deploy "$RUNNER_TEMP/bundle smoke/"
+          (
+            cd "$RUNNER_TEMP/bundle smoke"
+            test "$(./proxmox-auto-deploy --version)" = "$version"
+            test -n "$expected"
+            test "$(MOD_TYPE=DEMO_1 ./proxmox-auto-deploy --core roles)" = "$expected"
+          )
+          (cd dist && sha256sum proxmox-auto-deploy > proxmox-auto-deploy.sha256)
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: proxmox-auto-deploy
+          path: |
+            dist/proxmox-auto-deploy
+            dist/proxmox-auto-deploy.sha256
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: proxmox-auto-deploy
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          (cd dist && sha256sum -c proxmox-auto-deploy.sha256)
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            dist/proxmox-auto-deploy dist/proxmox-auto-deploy.sha256

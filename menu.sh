@@ -6,7 +6,7 @@ if [ -z "$TMUX" ] && command -v tmux &> /dev/null; then
     if [ $? -ne 0 ]; then
         echo -e "\nОбнаружена незащищенная консоль. Создаю автономный контур безопасности (tmux)..."
         sleep 1
-        exec tmux new-session -s it_spetsnaz "$0 $@"
+        exec tmux new-session -s it_spetsnaz -- bash "$0" "$@"
     else
         echo -e "\nПодключаюсь к активному контуру ИТ-спецназа..."
         sleep 1
@@ -14,7 +14,12 @@ if [ -z "$TMUX" ] && command -v tmux &> /dev/null; then
     fi
 fi
 
-CORE_SCRIPT="./core.sh"
+CORE_SOURCE="./core.sh"
+CORE_SCRIPT="$CORE_SOURCE"
+if declare -F run_bundled_core >/dev/null; then
+    CORE_SOURCE="$0"
+    CORE_SCRIPT=run_bundled_core
+fi
 
 detect_host_os() {
     if [ -f /etc/altlinux-release ]; then
@@ -984,7 +989,7 @@ res_activate_defaults() {
 for _v in $(compgen -v RES_); do export "$_v"; done
 export APT_MODE WAN_BR IMG_DIR TARGET_STORAGE PROXY_IP EXPERT_SUBNET EXPERT_GW EXPERT_DNS EXPERT_IFACE APT_MIRROR_HOST APT_CACHE_PORT
 
-CORE_VERSION=$(grep -m1 -oP 'SPETSNAZ_VERSION="\K[0-9.]+' ./core.sh 2>/dev/null)
+CORE_VERSION=$(grep -m1 -oP 'SPETSNAZ_VERSION="\K[0-9.]+' "$CORE_SOURCE" 2>/dev/null)
 if [ "$CORE_VERSION" = "$MENU_VERSION" ]; then
     VERSION_LABEL="$MENU_VERSION"
 else
@@ -1091,7 +1096,7 @@ while true; do
             rm -f "$CONFIG_FILE"
             echo -e "\nСтарая конфигурация стерта. Инициирую перезагрузку оболочки..."
             sleep 1
-            exec "$0" "$@"
+            exec bash "$0" "$@"
         fi
         continue
     fi
