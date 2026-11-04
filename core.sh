@@ -1,5 +1,5 @@
 #!/bin/bash
-SPETSNAZ_VERSION="0.7.9 (2026-10-20)"
+SPETSNAZ_VERSION="0.7.12 (2026-11-04)"
 NODE=$(hostname -s)
 
 # Параметры экспертного доступа и APT-кэша (переопределяются в spetsnaz.conf)
@@ -459,13 +459,11 @@ role_label() {
 # Раскладка ВМ стенда: строки "смещение#роль#адаптеры". Используется деплоем и оценкой места.
 stand_vm_list() {
     local br=$1 s=$2
-    local mac_stand_byte
-    mac_stand_byte=$(printf '%02X' $((10#$s % 256)))
 
     local vms=()
     if [[ "$MOD_TYPE" == DEMO* ]]; then
         vms=(
-            "1#ISP#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:01 net1:vmbr$((br+1)) net2:vmbr$((br+2))"
+            "1#ISP#net0:$WAN_BR net1:vmbr$((br+1)) net2:vmbr$((br+2))"
             "2#HQ-RTR#net0:$WAN_BR,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+3))"
             "3#BR-RTR#net0:$WAN_BR,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+4))"
             "4#BR-FW#net0:vmbr$((br+4)) net1:vmbr$((br+5))"
@@ -477,12 +475,12 @@ stand_vm_list() {
         vms=(
             "1#PROV-GW#net0:vmbr$((br+9)) net1:vmbr$((br+10))"
             "2#PROV-SW#net0:vmbr$((br+8)) net1:vmbr$((br+9)) net2:vmbr$((br+10))"
-            "3#COD-GW#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:03,link_down=1 net1:vmbr$((br+4)) net2:vmbr$((br+5))"
-            "4#GW-1#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:04,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+4))"
-            "5#GW-2#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:05,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+6))"
-            "6#GW-3#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:06,link_down=1 net1:vmbr$((br+3)) net2:vmbr$((br+8))"
+            "3#COD-GW#net0:$WAN_BR,link_down=1 net1:vmbr$((br+4)) net2:vmbr$((br+5))"
+            "4#GW-1#net0:$WAN_BR,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+4))"
+            "5#GW-2#net0:$WAN_BR,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+6))"
+            "6#GW-3#net0:$WAN_BR,link_down=1 net1:vmbr$((br+3)) net2:vmbr$((br+8))"
             "7#ZSPD-FW#net0:vmbr$((br+7))"
-            "8#GW-CORE#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:08 net1:vmbr$((br+1)) net2:vmbr$((br+2)) net3:vmbr$((br+3))"
+            "8#GW-CORE#net0:$WAN_BR net1:vmbr$((br+1)) net2:vmbr$((br+2)) net3:vmbr$((br+3))"
             "9#ZSPD-SW#net0:vmbr$((br+6)) net1:vmbr$((br+7))"
             "10#COD-SRV-1#net0:vmbr$((br+5)) net1:vmbr$((br+5))"
             "11#COD-SRV-2#net0:vmbr$((br+5))"
@@ -494,33 +492,56 @@ stand_vm_list() {
     printf '%s\n' "${vms[@]}"
 }
 
-patch_net() {
-    local v_id=$1; local iface=$2; local target=$3
-    local current=$(qm config $v_id | grep "^${iface}:" | sed "s/^${iface}:\s*//")
-    if [ -z "$current" ]; then
-        echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: В шаблоне ВМ $v_id отсутствует адаптер $iface! Сеть $target не подключена.${C_NC}" >&2
-        return 1
-    fi
+# Локальный unicast MAC. VMID уникален в кластере; номер стенда может повторяться.
+wan_mac() {
+    local vid=$1
+    printf '02:53:%02X:%02X:%02X:%02X' "$((vid>>24 & 255))" "$((vid>>16 & 255))" "$((vid>>8 & 255))" "$((vid & 255))"
+}
 
-    local new_bridge=$(echo "$target" | cut -d',' -f1)
-    local patched=$(echo "$current" | sed -E "s/bridge=[^,]+/bridge=$new_bridge/")
+net_value() {
+    local vid=$1 current=$2 target=$3 bridge opt item head vlan down=0
+    local -a spec old
+    IFS=, read -ra spec <<< "$target"
+    IFS=, read -ra old <<< "$current"
+    bridge=${spec[0]}
+    head=${old[0]}
+    [[ "$bridge" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}$ && "$head" =~ ^[a-zA-Z0-9_]+(=([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})?$ ]] || return 1
+    if [ "$bridge" = "$WAN_BR" ]; then head="${head%%=*}=$(wan_mac "$vid")"; fi
+    for item in "${old[@]:1}"; do
+        case "$item" in bridge=*|tag=*|trunks=*|link_down=*) ;; *) head+=",$item" ;; esac
+    done
+    for opt in "${spec[@]:1}"; do
+        case "$opt" in
+            link_down=1) down=1 ;;
+            tag=*) vlan=${opt#tag=}; [[ "$vlan" =~ ^[0-9]{1,4}$ ]] && ((10#$vlan >= 1 && 10#$vlan <= 4094)) || return 1; head+=",tag=$((10#$vlan))" ;;
+            *) return 1 ;;
+        esac
+    done
+    # Для отключённого WAN одного link_down недостаточно: не привязываем адаптер к внешнему мосту.
+    if [ "$bridge" != "$WAN_BR" ] || [ "$down" -eq 0 ]; then head+=",bridge=$bridge"; fi
+    printf '%s,link_down=%s\n' "$head" "$down"
+}
 
-    if [[ "$target" == *"tag="* ]]; then
-        local new_tag=$(echo "$target" | grep -o 'tag=[0-9]*')
-        if [[ "$patched" == *"tag="* ]]; then
-            patched=$(echo "$patched" | sed -E "s/tag=[0-9]+/$new_tag/")
-        else
-            patched="$patched,$new_tag"
+configure_stand_net() {
+    local vid=$1 rules=$2 cfg rule iface current patched extra remove="" status
+    local -a args=()
+    status=$(qm status "$vid") && [ "$status" = "status: stopped" ] || return 1
+    cfg=$(qm config "$vid") || return 1
+    for rule in $rules; do
+        iface=${rule%%:*}
+        current=$(awk -v key="$iface:" '$1 == key {print $2; exit}' <<< "$cfg")
+        if ! patched=$(net_value "$vid" "$current" "${rule#*:}"); then
+            echo "✖ ВМ $vid: нет корректного адаптера $iface для ${rule#*:}." >&2
+            return 1
         fi
-    fi
-
-    if [[ "$target" == *"macaddr="* ]]; then
-        local new_mac=$(echo "$target" | sed -E 's/.*macaddr=([0-9a-fA-F:]+).*/\1/')
-        patched=$(echo "$patched" | sed -E "s/[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}/$new_mac/")
-    fi
-    if [[ "$target" == *"link_down=1"* ]] && [[ "$patched" != *"link_down="* ]]; then patched="$patched,link_down=1"; fi
-
-    qm set $v_id --$iface "$patched" >/dev/null 2>&1
+        args+=("--$iface" "$patched")
+    done
+    # Лишние адаптеры из бэкапа могут вести на чужие мосты.
+    while read -r extra; do
+        [[ " $rules " == *" $extra:"* ]] || remove+="${remove:+,}$extra"
+    done < <(awk -F: '/^net[0-9]+:/ {print $1}' <<< "$cfg")
+    [ -z "$remove" ] || args+=(--delete "$remove")
+    qm set "$vid" "${args[@]}"
 }
 
 # ===================== Память и ядра ВМ по ролям (необязательно) =====================
@@ -634,12 +655,10 @@ restore_new_vm() {
 }
 
 finish_vm() {
-    local vid=$1 role=$2 rules=$3 tag=$4 token=$5 label spec rc rule
+    local vid=$1 role=$2 rules=$3 tag=$4 token=$5 label spec rc
     label=$(role_label "$role")
     qm set "$vid" --onboot 0 || return 1
-    for rule in $rules; do
-        patch_net "$vid" "${rule%%:*}" "${rule#*:}" || return 1
-    done
+    configure_stand_net "$vid" "$rules" || return 1
     qm set "$vid" --name "$label" --tablet 1 --vga qxl || return 1
     spec=$(iso_spec)
     if [ -n "$spec" ] && [[ " ${spec#*|} " == *" $role "* ]]; then

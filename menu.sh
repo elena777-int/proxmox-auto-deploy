@@ -1,5 +1,5 @@
 #!/bin/bash
-MENU_VERSION="0.7.9"   # версия menu.sh; должна совпадать с версией core.sh (SPETSNAZ_VERSION)
+MENU_VERSION="0.7.12"   # версия menu.sh; должна совпадать с версией core.sh (SPETSNAZ_VERSION)
 
 if [ -z "$TMUX" ] && command -v tmux &> /dev/null; then
     tmux has-session -t it_spetsnaz 2>/dev/null
