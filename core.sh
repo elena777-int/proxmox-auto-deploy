@@ -499,7 +499,7 @@ patch_net() {
     local current=$(qm config $v_id | grep "^${iface}:" | sed "s/^${iface}:\s*//")
     if [ -z "$current" ]; then
         echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: В шаблоне ВМ $v_id отсутствует адаптер $iface! Сеть $target не подключена.${C_NC}" >&2
-        return
+        return 1
     fi
 
     local new_bridge=$(echo "$target" | cut -d',' -f1)
@@ -573,14 +573,11 @@ add_extra_disks() {
     [ "$cnt" -gt 0 ] || return 0
     cfg=$(qm config "$vid" 2>/dev/null)
     first=$(echo "$cfg" | grep -E '^(scsi|virtio|sata|ide)[0-9]+: ' | grep -v 'media=cdrom' | head -n 1)
-    [ -z "$first" ] && return 0
+    [ -n "$first" ] || { echo "✖ HQ-SRV: не найден основной диск." >&2; return 1; }
     have=$(echo "$cfg" | grep -E '^(scsi|virtio|sata|ide)[0-9]+: ' | grep -vc 'media=cdrom')
-    if [ "$have" -gt 1 ]; then
-        echo -e "      у HQ-SRV в образе уже $have диска(ов): основной и дополнительных — $((have - 1)); новые не добавляю"
-        return 0
-    fi
+    [ "$have" -ge $((cnt+1)) ] && return 0
     bus=$(echo "$first" | sed -E 's/^([a-z]+)[0-9]+:.*/\1/')
-    need=$cnt
+    need=$((cnt+1-have))
     for i in $(seq 0 30); do
         [ "$need" -eq 0 ] && break
         [ "$bus" = "ide" ] && [ "$i" -gt 3 ] && break
@@ -592,7 +589,7 @@ add_extra_disks() {
         fi
     done
     [ "$added" -gt 0 ] && echo -e "      HQ-SRV: добавлено дисков для RAID — $added по $size ГБ (параметр HQSRV_EXTRA_DISKS)"
-    return 0
+    [ "$need" -eq 0 ]
 }
 
 pool_info() {
@@ -607,6 +604,58 @@ pool_owns_vm() {
 
 vm_id_in_use() {
     jq -e --argjson id "$2" 'any(.[]; .vmid == $id)' >/dev/null <<< "$1"
+}
+
+vm_ready() {
+    local cfg
+    cfg=$(qm config "$1") || return 1
+    awk '/^tags:/ {print $2}' <<< "$cfg" | tr ';,' '\n' | grep -Fxq "spz-ready-$2" &&
+        snap_exists "$1" Day0
+}
+
+restore_new_vm() {
+    local vid=$1 archive=$2 pool=$3 out cfg status
+    # --pool добавляет ВМ к пулу при успешном восстановлении. Никогда не перезаписываем занятый ID.
+    if ! out=$( (set -o pipefail; zstdcat "$archive" | qmrestore - "$vid" --storage "$TARGET_STORAGE" --pool "$pool") 2>&1 ); then
+        echo "✖ ВМ $vid: восстановление не удалось. $(tail -n 3 <<< "$out" | tr '\n' ' ')" >&2
+        # Эта диагностика идёт от уже запущенного воркера qmrestore. При
+        # коллизии ID CLI отказывает до его запуска. Стираем только пустую
+        # заглушку нашего неудачного восстановления, без обхода блокировок.
+        if [[ "$out" == *"some or all disks were not completely restored. VM $vid state is NOT cleaned up."* ]]; then
+            if cfg=$(qm config "$vid") && [[ -z "$cfg" || "$cfg" == "memory: 128" ]] &&
+                status=$(qm status "$vid") && [ "$status" = "status: stopped" ] && qm destroy "$vid"; then
+                echo "  Пустая запись ВМ $vid после сбоя удалена; роль можно повторить." >&2
+            else
+                echo "  ВМ $vid не удалена автоматически. Проверьте её конфигурацию перед повтором." >&2
+            fi
+        fi
+        return 1
+    fi
+}
+
+finish_vm() {
+    local vid=$1 role=$2 rules=$3 tag=$4 token=$5 label spec rc rule
+    label=$(role_label "$role")
+    qm set "$vid" --onboot 0 || return 1
+    for rule in $rules; do
+        patch_net "$vid" "${rule%%:*}" "${rule#*:}" || return 1
+    done
+    qm set "$vid" --name "$label" --tablet 1 --vga qxl || return 1
+    spec=$(iso_spec)
+    if [ -n "$spec" ] && [[ " ${spec#*|} " == *" $role "* ]]; then
+        attach_iso "$vid" "${spec%%|*}"; rc=$?
+        # Отсутствующий ISO уже показывается отдельным предупреждением.
+        [ "$rc" -le 1 ] || return 1
+    fi
+    case "$MOD_TYPE:$role" in
+        DEMO_2:HQ-SRV|DEMO_3:HQ-SRV|DEMO_T2:HQ-SRV|DEMO_T3:HQ-SRV|DEMO_GOLD:HQ-SRV)
+            add_extra_disks "$vid" || return 1 ;;
+    esac
+    if [ "${RES_APPLY:-0}" = 1 ]; then apply_resources "$vid" "$role" || return 1; fi
+    qm set "$vid" --tags "$tag,spz-ready-$token" || return 1
+    if ! snap_exists "$vid" Day0; then
+        qm snapshot "$vid" Day0 --description "Чистый старт стенда" || return 1
+    fi
 }
 
 stand_account() {
@@ -631,76 +680,6 @@ stand_account() {
     printf 'Стенд %s (%s),%s,%s\n' "$s" "$MOD_TYPE" "$account" "$pass" >> "$CSV_FILE"
 }
 
-restore_new_vm() {
-    local vid=$1 archive=$2 pool=$3 out cfg status
-    # --pool добавляет ВМ к пулу при успешном восстановлении. Никогда не перезаписываем занятый ID.
-    if ! out=$( (set -o pipefail; zstdcat "$archive" | qmrestore - "$vid" --storage "$TARGET_STORAGE" --pool "$pool") 2>&1 ); then
-        echo "✖ ВМ $vid: восстановление не удалось. $(tail -n 3 <<< "$out" | tr '\n' ' ')" >&2
-        # Эта диагностика идёт от уже запущенного воркера qmrestore. При
-        # коллизии ID CLI отказывает до его запуска. Стираем только пустую
-        # заглушку нашего неудачного восстановления, без обхода блокировок.
-        if [[ "$out" == *"some or all disks were not completely restored. VM $vid state is NOT cleaned up."* ]]; then
-            if cfg=$(qm config "$vid") && [[ -z "$cfg" || "$cfg" == "memory: 128" ]] &&
-                status=$(qm status "$vid") && [ "$status" = "status: stopped" ] && qm destroy "$vid"; then
-                echo "  Пустая запись ВМ $vid после сбоя удалена; роль можно повторить." >&2
-            else
-                echo "  ВМ $vid не удалена автоматически. Проверьте её конфигурацию перед повтором." >&2
-            fi
-        fi
-        return 1
-    fi
-}
-
-# Восстановить одну ВМ роли из образа модуля и подготовить её как при деплое:
-# сети стенда, ISO, метки, пул, Day0. Код: 0 — готово; 1 — образ не найден; 2 — ошибка восстановления.
-restore_vm() {
-    local vid=$1 name=$2 nets_config=$3 pool=$4 pve_tag=$5
-    local vm_label full_archive_path info net_rule snap_err
-    vm_label=$(role_label "$name")
-    full_archive_path=$(find_image "$name" "$vm_label")
-
-    if [ -z "$full_archive_path" ] || [ ! -f "$full_archive_path" ]; then
-        local search_dir
-        IFS='|' read -r search_dir _ _ <<< "$(resolve_img_dir)"
-        echo -e "${C_YELLOW}⚠ ВНИМАНИЕ: Образ для ${name} не найден в ${search_dir}! Пропускаю ВМ.${C_NC}"
-        return 1
-    fi
-
-    local rt0=$SECONDS
-    restore_new_vm "$vid" "$full_archive_path" "$pool" || return 2
-    info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 2
-    qm set $vid --name "$vm_label" >/dev/null 2>&1
-
-    local rdt=$((SECONDS - rt0))
-    echo -e "    ${C_GREEN}✔ Боевая единица $vm_label (ID: $vid) успешно развернута! Образ: ${full_archive_path#$IMG_DIR/} (за $((rdt / 60)) мин $((rdt % 60)) с)${C_NC}"
-
-    # Диск с дополнительными материалами (iso_spec): DEMO_1 — не нужен; DEMO_2/DEMO_3/DEMO_GOLD — Additional_de.iso к HQ-SRV и BR-SRV (по заданию; HQ-CLI диск не нужен);
-    # REG/MOD/GOLD — Additional_rc.iso к COD-ADMIN. Если ISO нет — предупреждение и счётчик ISO_MISSING (итог в конце деплоя)
-    local ispec=$(iso_spec)
-    if [ -n "$ispec" ] && [[ " ${ispec#*|} " == *" $name "* ]]; then
-        attach_iso "$vid" "${ispec%%|*}"
-    fi
-    if [[ "$MOD_TYPE" == DEMO_2 || "$MOD_TYPE" == DEMO_3 || "$MOD_TYPE" == DEMO_T2 || "$MOD_TYPE" == DEMO_T3 || "$MOD_TYPE" == DEMO_GOLD ]]; then
-        [ "$name" == "HQ-SRV" ] && add_extra_disks "$vid"
-    fi
-
-    for net_rule in $nets_config; do
-        patch_net $vid "${net_rule%%:*}" "${net_rule#*:}"
-    done
-
-    qm set $vid --tags "$pve_tag" >/dev/null 2>&1
-    qm set $vid --tablet 1 --vga qxl >/dev/null 2>&1
-    [ "${RES_APPLY:-0}" = "1" ] && apply_resources "$vid" "$name"
-
-    sleep 1; qm unlock $vid >/dev/null 2>&1
-    if ! snap_exists "$vid" "Day0"; then
-        snap_err=$(qm snapshot $vid "Day0" --description "Чистый старт стенда" 2>&1) || echo -e "    ${C_YELLOW}⚠ VM $vid: снапшот Day0 не создан: $(echo "$snap_err" | tail -n 1)${C_NC}"
-    fi
-    return 0
-}
-
-# Переразвернуть одну машину стенда из образа модуля (поломанная ВМ, другая версия образа).
-# VLAN-метки берутся из снапшота Day0 этой ВМ (если его нет — из текущей конфигурации), хранилище — то, где лежит её диск.
 redeploy_vm() {
     local s=$1 role=$2 pool="${MOD_TYPE}_S$1" info owner line off name nets vid label cur src rule iface target tag new_nets="" st="" ids archive
     info=$(pool_info "$pool") || return 1
@@ -740,29 +719,72 @@ redeploy_vm() {
         info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 1
         qm destroy "$vid" || return 1
     fi
-    TARGET_STORAGE="${st:-$TARGET_STORAGE}" restore_vm "$vid" "$name" "$nets" "$pool" "${MOD_TYPE,,},stand_$s"
+    TARGET_STORAGE="${st:-$TARGET_STORAGE}" restore_new_vm "$vid" "$archive" "$pool" || return 1
+    info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 1
+    finish_vm "$vid" "$name" "$nets" "${MOD_TYPE,,},stand_$s" "$STAND_TOKEN"
 }
 
 deploy_from_images() {
-    local s=$1 b_id=$2 pool="${MOD_TYPE}_S$1" pve_tag="${MOD_TYPE,,},stand_$1" token owner
-    token=$(tr -d '-' </proc/sys/kernel/random/uuid) || return 1
-    owner="spetsnaz-v1:$NODE:$b_id:$token"
-    pvesh create /pools --poolid "$pool" --comment "$owner" || return 1
-    stand_network create "$b_id" "$owner" || return 1
-    case "$MOD_TYPE" in REG_*|MOD_*|GOLD_*) ensure_ovs_flows "$b_id" || return 1 ;; esac
-    stand_account "$s" "$pool" "$owner" || return 1
-
-    local vms=()
-    mapfile -t vms < <(stand_vm_list "$b_id" "$s")
-
-    for vm in "${vms[@]}"; do
-        local off name nets_config vid
-        IFS='#' read -r off name nets_config <<< "$vm"
-        vid=$((b_id + off))
-        restore_vm "$vid" "$name" "$nets_config" "$pool" "$pve_tag"
-        [ $? -eq 1 ] && DEPLOY_SKIPPED=$((DEPLOY_SKIPPED + 1))
+    local s=$1 pool="${MOD_TYPE}_S$1" owner info ids pools token base line off name rules vid archive failed=0 exists=0
+    local -a vms=()
+    local -A archives=()
+    pools=$(pool_inventory) || return 1
+    if jq -e --arg pool "$pool" 'any(.[]; .poolid == $pool)' >/dev/null <<< "$pools"; then
+        exists=1
+        info=$(pool_info "$pool") || return 1
+        owner=$(jq -r '.comment // ""' <<< "$info") || return 1
+        if ! read_stand_owner "$owner" || [ "$STAND_NODE" != "$NODE" ]; then
+            echo "✖ $pool: существующий пул без метки этого узла. Пул оставлен без изменений." >&2
+            return 1
+        fi
+        base=$STAND_BASE token=$STAND_TOKEN
+    else
+        base=$(get_next_free_hundred) || return 1
+        token=$(tr -d '-' </proc/sys/kernel/random/uuid) || return 1
+        owner="spetsnaz-v1:$NODE:$base:$token"
+    fi
+    mapfile -t vms < <(stand_vm_list "$base" "$s")
+    ids=$(cluster_vms) || return 1
+    # Проверяем все требуемые образы и конфликты до первого изменения.
+    for line in "${vms[@]}"; do
+        IFS='#' read -r off name rules <<< "$line"
+        vid=$((base+off))
+        if vm_id_in_use "$ids" "$vid"; then
+            if ! pool_owns_vm "$info" "$vid"; then
+                echo "✖ $name: ID $vid занят другой ВМ." >&2
+                failed=1
+            fi
+        else
+            archive=$(find_image "$name" "$(role_label "$name")")
+            if [ ! -s "$archive" ]; then echo "✖ $name: образ отсутствует или пуст." >&2; failed=1
+            else archives[$vid]=$archive; fi
+        fi
     done
-    return 0
+    [ "$failed" -eq 0 ] || return 1
+    if [ "$exists" -eq 0 ]; then
+        pvesh create /pools --poolid "$pool" --comment "$owner" || return 1
+    fi
+    stand_network create "$base" "$owner" || return 1
+    case "$MOD_TYPE" in REG_*|MOD_*|GOLD_*) ensure_ovs_flows "$base" || return 1 ;; esac
+
+    for line in "${vms[@]}"; do
+        IFS='#' read -r off name rules <<< "$line"
+        vid=$((base+off))
+        if [ -n "${archives[$vid]}" ]; then
+            if ! restore_new_vm "$vid" "${archives[$vid]}" "$pool"; then failed=1; continue; fi
+        elif vm_ready "$vid" "$token"; then
+            echo "  ✔ $name ($vid): уже готова."
+            continue
+        fi
+        if info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" &&
+            finish_vm "$vid" "$name" "$rules" "${MOD_TYPE,,},stand_$s" "$token"; then
+            echo "  ✔ $name ($vid): готова."
+        else
+            echo "  ✖ $name ($vid): настройка не завершена." >&2
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] && stand_account "$s" "$pool" "$owner"
 }
 
 # --- Снапшоты: с проверкой существования и видимым результатом (раньше ошибки qm скрывались) ---
@@ -817,6 +839,16 @@ snap_op() {
             else echo -e "    ${C_RED}✖ $label: $(echo "$out" | tail -n 1)${C_NC}"; SNAP_FAIL=$((SNAP_FAIL+1)); fi
             ;;
     esac
+}
+
+stand_vms_ready() {
+    local s=$1 info=$2 off vid count=0
+    while IFS='#' read -r off _; do
+        vid=$((STAND_BASE+off))
+        pool_owns_vm "$info" "$vid" && vm_ready "$vid" "$STAND_TOKEN" || return 1
+        count=$((count+1))
+    done < <(stand_vm_list "$STAND_BASE" "$s")
+    jq -e --argjson count "$count" '[.members[] | select(.type == "qemu")] | length == $count' >/dev/null <<< "$info"
 }
 
 destroy_stand() {
@@ -991,8 +1023,9 @@ manage_state() {
             if [ "$ACTION" = start ]; then
                 if read_stand_owner "$owner"; then
                     if [ "$STAND_NODE" != "$NODE" ] ||
-                        ! stand_network verify "$STAND_BASE" "$owner"; then
-                        echo "✖ $pool_name: сеть стенда не подтверждена на этом узле." >&2
+                        ! stand_network verify "$STAND_BASE" "$owner" ||
+                        ! stand_vms_ready "$s" "$info"; then
+                        echo "✖ $pool_name: стенд не готов к запуску на этом узле. Повторите развёртывание." >&2
                         failed=1; continue
                     fi
                     case "$MOD_TYPE" in
@@ -1575,10 +1608,8 @@ case $COMMAND in
     deploy)
         [ ! -d "$IMG_DIR" ] && echo -e "${C_RED}✖ Ошибка: Директория $IMG_DIR не найдена!${C_NC}" && exit 1
         if [ ! -f "$CSV_FILE" ]; then
-            echo "Стенд,Логин,Пароль" > "$CSV_FILE"
-            chmod 600 "$CSV_FILE" 2>/dev/null
+            (umask 077; printf 'Стенд,Логин,Пароль\n' > "$CSV_FILE") || exit 1
         fi
-        setup_pve_roles
 
         echo -e "ИТ-СПЕЦНАЗ, версия скриптов: $SPETSNAZ_VERSION"
         IFS='|' read -r IMG_SRC_DIR IMG_SRC_DEPTH IMG_SRC_KIND <<< "$(resolve_img_dir)"
@@ -1604,26 +1635,26 @@ case $COMMAND in
                 ;;
         esac
 
-        DEPLOY_SKIPPED=0; ISO_MISSING=0
+        ISO_MISSING=0
         ISO_SPEC_NAME=$(iso_spec); ISO_SPEC_NAME=${ISO_SPEC_NAME%%|*}
         if [ -n "$ISO_SPEC_NAME" ] && ! find_iso "$ISO_SPEC_NAME" >/dev/null; then
             echo -e "${C_YELLOW}⚠ Диск с дополнительными материалами $ISO_SPEC_NAME не найден ни в одном хранилище ISO: машины будут развёрнуты без него.${C_NC}"
         fi
-        EXPANDED_STANDS=()
-        for s in $(expand_ranges "${STANDS[@]}"); do
-            EX_IDS=$(pool_vmids "${MOD_TYPE}_S${s}")
-            if [ -n "$EX_IDS" ]; then
-                echo -e "${C_RED}✖ Стенд $s ($MOD_TYPE) уже развёрнут: в пуле ${MOD_TYPE}_S${s} машин — $(echo "$EX_IDS" | wc -l) (ID $(echo "$EX_IDS" | head -n 1)…). Пропускаю.${C_NC}"
-                echo -e "${C_YELLOW}  Чтобы развернуть заново, сначала удалите стенд (☠️ Удаление полигона) или выберите другой номер.${C_NC}"
-                continue
-            fi
-            EXPANDED_STANDS+=("$s")
-        done
+        mapfile -t EXPANDED_STANDS < <(expand_ranges "${STANDS[@]}" | tr -s ' ' '\n' | sed '/^$/d' | sort -nu)
         if [ "${#EXPANDED_STANDS[@]}" -eq 0 ]; then
-            echo -e "${C_YELLOW}Новых стендов для развёртывания нет.${C_NC}"; exit 0
+            echo "✖ Укажите номера стендов." >&2; exit 1
         fi
-
-        space_check "${#EXPANDED_STANDS[@]}"; SPACE_RC=$?
+        # Оценка по полным комплектам нужна для новых стендов. Уже созданный
+        # стенд восстанавливает только недостающие ВМ и не резервирует весь объём заново.
+        POOLS=$(pool_inventory) || exit 1
+        NEW_STANDS=0
+        for s in "${EXPANDED_STANDS[@]}"; do
+            if ! jq -e --arg pool "${MOD_TYPE}_S$s" 'any(.[]; .poolid == $pool)' >/dev/null <<< "$POOLS"; then
+                NEW_STANDS=$((NEW_STANDS + 1))
+            fi
+        done
+        SPACE_RC=0
+        if [ "$NEW_STANDS" -gt 0 ]; then space_check "$NEW_STANDS"; SPACE_RC=$?; fi
         if [ "$SPACE_RC" -eq 2 ]; then
             if [ "${SPACE_FORCE:-0}" = "1" ]; then
                 echo -e "${C_YELLOW}⚠ Места не хватает, но развёртывание запущено по подтверждению (FORCE). Возможны ошибки ввода-вывода (io-error) у ВМ.${C_NC}"
@@ -1634,23 +1665,22 @@ case $COMMAND in
         fi
         echo
 
+        DEPLOY_OK=0 DEPLOY_FAIL=0
         for s in "${EXPANDED_STANDS[@]}"; do
-            STAND_BASE=$(get_next_free_hundred) || exit 1
-            deploy_from_images "$s" "$STAND_BASE" || exit 1
-            read -r SU_USED SU_DECL SU_CNT < <(pool_usage "${MOD_TYPE}_S${s}")
-            echo -e "    Стенд $s занимает на дисках: $(gb "$SU_USED") ГБ (объявленный объём дисков $(gb "$SU_DECL") ГБ, ВМ: $SU_CNT)"
-            sleep 1
+            if deploy_from_images "$s"; then
+                DEPLOY_OK=$((DEPLOY_OK + 1))
+            else
+                DEPLOY_FAIL=$((DEPLOY_FAIL + 1))
+                echo "✖ Стенд $s: развёртывание не завершено." >&2
+            fi
         done
 
-        if [ "$DEPLOY_SKIPPED" -gt 0 ]; then
-            echo -e "\n${C_YELLOW}⚠ Пропущено машин из-за отсутствия образов: $DEPLOY_SKIPPED. Проверьте имена файлов в $IMG_DIR/$MOD_TYPE.${C_NC}"
-        fi
         if [ "${ISO_MISSING:-0}" -gt 0 ]; then
             echo -e "\n${C_YELLOW}⚠ Без диска с дополнительными материалами (${ISO_SPEC_NAME}) осталось машин: $ISO_MISSING.${C_NC}"
             echo -e "${C_YELLOW}  Загрузите ISO в хранилище (local → ISO Images) и подключите: Состояние и доступ → «Подключить диск с доп. материалами».${C_NC}"
         fi
-        echo -e "\n${C_GREEN}✔ Деплой ($MOD_TYPE) завершен! Доступы в $CSV_FILE${C_NC}"
-        cat "$CSV_FILE" | column -t -s ','
+        echo "Итог $MOD_TYPE: готово стендов $DEPLOY_OK, не завершено $DEPLOY_FAIL. Доступы: $CSV_FILE"
+        [ "$DEPLOY_FAIL" -eq 0 ] || exit 1
         ;;
     manage)
         echo -e "${C_GREEN}Выполняю команду $ACTION...${C_NC}"

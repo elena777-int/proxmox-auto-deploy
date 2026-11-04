@@ -659,7 +659,10 @@ retag_existing_pools() {
             echo -e "  ${C_YELLOW}Пул $pool${C_NC} -> метка '$tag'"
 
             for vmid in $vmids; do
-                qm set "$vmid" --tags "$tag" >/dev/null 2>&1 && total_vms=$((total_vms + 1))
+                local cfg ready
+                cfg=$(qm config "$vmid" 2>/dev/null) || continue
+                ready=$(awk '/^tags:/ {print $2}' <<< "$cfg" | tr ';,' '\n' | grep -E '^spz-ready-[a-f0-9]{32}$' | paste -sd, -)
+                qm set "$vmid" --tags "$tag${ready:+,$ready}" >/dev/null 2>&1 && total_vms=$((total_vms + 1))
             done
         else
             skipped=$((skipped + 1))
@@ -1681,10 +1684,14 @@ while true; do
     if [ "$ACTION" == "aptdirect" ]; then
         APT_DIRECT=1 $CORE_SCRIPT patch $STANDS
     elif [ "$ACTION" == "deploy" ] || [ "$ACTION" == "patch" ] || [ "$ACTION" == "rotate" ]; then
-        $CORE_SCRIPT $ACTION $STANDS $EXPERT_FLAG
+        if ! $CORE_SCRIPT "$ACTION" $STANDS $EXPERT_FLAG; then
+            echo "✖ Операция выполнена не полностью. См. результат выше."
+        fi
     else
         export ACTION
-        $CORE_SCRIPT manage $STANDS
+        if ! $CORE_SCRIPT manage $STANDS; then
+            echo "✖ Операция выполнена не полностью. См. результат выше."
+        fi
     fi
 
     echo -e "\n---------------------------------------------------"
