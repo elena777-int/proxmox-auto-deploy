@@ -631,11 +631,31 @@ stand_account() {
     printf 'Стенд %s (%s),%s,%s\n' "$s" "$MOD_TYPE" "$account" "$pass" >> "$CSV_FILE"
 }
 
+restore_new_vm() {
+    local vid=$1 archive=$2 pool=$3 out cfg status
+    # --pool добавляет ВМ к пулу при успешном восстановлении. Никогда не перезаписываем занятый ID.
+    if ! out=$( (set -o pipefail; zstdcat "$archive" | qmrestore - "$vid" --storage "$TARGET_STORAGE" --pool "$pool") 2>&1 ); then
+        echo "✖ ВМ $vid: восстановление не удалось. $(tail -n 3 <<< "$out" | tr '\n' ' ')" >&2
+        # Эта диагностика идёт от уже запущенного воркера qmrestore. При
+        # коллизии ID CLI отказывает до его запуска. Стираем только пустую
+        # заглушку нашего неудачного восстановления, без обхода блокировок.
+        if [[ "$out" == *"some or all disks were not completely restored. VM $vid state is NOT cleaned up."* ]]; then
+            if cfg=$(qm config "$vid") && [[ -z "$cfg" || "$cfg" == "memory: 128" ]] &&
+                status=$(qm status "$vid") && [ "$status" = "status: stopped" ] && qm destroy "$vid"; then
+                echo "  Пустая запись ВМ $vid после сбоя удалена; роль можно повторить." >&2
+            else
+                echo "  ВМ $vid не удалена автоматически. Проверьте её конфигурацию перед повтором." >&2
+            fi
+        fi
+        return 1
+    fi
+}
+
 # Восстановить одну ВМ роли из образа модуля и подготовить её как при деплое:
 # сети стенда, ISO, метки, пул, Day0. Код: 0 — готово; 1 — образ не найден; 2 — ошибка восстановления.
 restore_vm() {
     local vid=$1 name=$2 nets_config=$3 pool=$4 pve_tag=$5
-    local vm_label full_archive_path out net_rule snap_err
+    local vm_label full_archive_path info net_rule snap_err
     vm_label=$(role_label "$name")
     full_archive_path=$(find_image "$name" "$vm_label")
 
@@ -647,10 +667,8 @@ restore_vm() {
     fi
 
     local rt0=$SECONDS
-    if ! out=$(zstdcat "$full_archive_path" | qmrestore - "$vid" --storage "$TARGET_STORAGE" --force 1 2>&1); then
-        echo -e "    ${C_RED}✖ $vm_label (ID: $vid): восстановление не удалось: $(echo "$out" | grep -v '^progress' | tail -n 2 | tr '\n' ' ')${C_NC}"
-        return 2
-    fi
+    restore_new_vm "$vid" "$full_archive_path" "$pool" || return 2
+    info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 2
     qm set $vid --name "$vm_label" >/dev/null 2>&1
 
     local rdt=$((SECONDS - rt0))
@@ -671,7 +689,6 @@ restore_vm() {
     done
 
     qm set $vid --tags "$pve_tag" >/dev/null 2>&1
-    pvesh set /pools/$pool -vms $vid >/dev/null 2>&1
     qm set $vid --tablet 1 --vga qxl >/dev/null 2>&1
     [ "${RES_APPLY:-0}" = "1" ] && apply_resources "$vid" "$name"
 
@@ -685,41 +702,44 @@ restore_vm() {
 # Переразвернуть одну машину стенда из образа модуля (поломанная ВМ, другая версия образа).
 # VLAN-метки берутся из снапшота Day0 этой ВМ (если его нет — из текущей конфигурации), хранилище — то, где лежит её диск.
 redeploy_vm() {
-    local s=$1 role=$2 pool="${MOD_TYPE}_S$1" base line off name nets vid label cur src rule iface target tag new_nets="" st=""
-    base=$(stand_base_id "$pool")
-    if [ -z "$base" ]; then
-        echo -e "${C_RED}✖ Стенд $s ($pool) не найден или пуст.${C_NC}"; return 1
+    local s=$1 role=$2 pool="${MOD_TYPE}_S$1" info owner line off name nets vid label cur src rule iface target tag new_nets="" st="" ids archive
+    info=$(pool_info "$pool") || return 1
+    owner=$(jq -r '.comment // ""' <<< "$info") || return 1
+    if ! read_stand_owner "$owner" || [ "$STAND_NODE" != "$NODE" ]; then
+        echo "✖ $pool: переразвёртывание доступно только для стенда с подтверждённой сетью на этом узле." >&2
+        return 1
     fi
-    pool_check_single "$pool" || return 1
-    VLAN_1=${VLAN_1:-100}; VLAN_2=${VLAN_2:-200}
-    line=$(stand_vm_list "$base" "$s" | awk -F'#' -v r="$role" '$2 == r')
-    if [ -z "$line" ]; then
-        echo -e "${C_RED}✖ В модуле $MOD_TYPE нет роли $role.${C_NC}"; return 1
-    fi
+    stand_network verify "$STAND_BASE" "$owner" || return 1
+    line=$(stand_vm_list "$STAND_BASE" "$s" | awk -F'#' -v r="$role" '$2 == r')
+    [ -n "$line" ] || { echo "✖ Неизвестная роль $role." >&2; return 1; }
     IFS='#' read -r off name nets <<< "$line"
-    vid=$((base + off)); label=$(role_label "$name")
+    vid=$((STAND_BASE + off)); label=$(role_label "$name")
+    archive=$(find_image "$name" "$label")
+    if [ ! -s "$archive" ]; then echo "✖ Образ $label не найден или пуст." >&2; return 1; fi
 
-    if qm config "$vid" >/dev/null 2>&1; then
-        cur=$(qm config "$vid" 2>/dev/null | awk '/^name:/{print $2; exit}')
-        if [ -n "$cur" ] && [ "$cur" != "$label" ] && [ "$cur" != "$name" ]; then
-            echo -e "${C_RED}✖ Стенд $s: ВМ $vid называется '$cur', ожидалась $label — ничего не меняю.${C_NC}"; return 1
+    ids=$(cluster_vms) || return 1
+    if vm_id_in_use "$ids" "$vid"; then
+        if ! pool_owns_vm "$info" "$vid"; then
+            echo "✖ ID $vid занят ВМ вне пула $pool на этом узле." >&2
+            return 1
         fi
-        src=$(qm config "$vid" --snapshot Day0 2>/dev/null)
-        [ -z "$src" ] && src=$(qm config "$vid" 2>/dev/null)
+        cur=$(qm config "$vid") || return 1
+        [ "$(awk '/^name:/ {print $2; exit}' <<< "$cur")" = "$label" ] || return 1
+        src=$(qm config "$vid" --snapshot Day0 2>/dev/null) || src=$cur
         for rule in $nets; do
             iface=${rule%%:*}; target=${rule#*:}
-            tag=$(echo "$src" | grep "^${iface}:" | grep -oP 'tag=\K[0-9]+')
-            if [[ "$target" == *tag=* ]] && [ -n "$tag" ]; then target=$(echo "$target" | sed -E "s/tag=[0-9]*/tag=$tag/"); fi
+            tag=$(grep "^$iface:" <<< "$src" | grep -oP 'tag=\K[0-9]+')
+            if [[ "$target" == *tag=* ]] && [ -n "$tag" ]; then target=${target%tag=*}tag=$tag; fi
             new_nets+="$iface:$target "
         done
         nets=$new_nets
-        st=$(qm config "$vid" 2>/dev/null | grep -E '^(scsi|sata|virtio|ide)[0-9]+: ' | grep -v 'media=cdrom' | head -n 1 | sed -E 's/^[a-z]+[0-9]+: ([^:,]+):.*/\1/')
-        echo -e "  Стенд $s: $label (ID $vid) — останавливаю и удаляю вместе со снапшотами..."
-        qm stop "$vid" >/dev/null 2>&1; sleep 1
-    else
-        echo -e "  Стенд $s: ВМ $label (ID $vid) отсутствует — будет создана."
+        st=$(grep -E '^(scsi|sata|virtio|ide)[0-9]+: ' <<< "$cur" | grep -v 'media=cdrom' | head -n 1 | sed -E 's/^[a-z]+[0-9]+: ([^:,]+):.*/\1/')
+        # Проверяем архив до необратимой замены.
+        zstd -tq -- "$archive" || return 1
+        if [ "$(qm status "$vid")" != "status: stopped" ]; then qm stop "$vid" || return 1; fi
+        info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 1
+        qm destroy "$vid" || return 1
     fi
-
     TARGET_STORAGE="${st:-$TARGET_STORAGE}" restore_vm "$vid" "$name" "$nets" "$pool" "${MOD_TYPE,,},stand_$s"
 }
 

@@ -1559,7 +1559,9 @@ while true; do
             continue
         fi
         clear
-        REDEPLOY_ROLE="$REDEPLOY_ROLE" $CORE_SCRIPT redeploy $STANDS
+        if ! REDEPLOY_ROLE="$REDEPLOY_ROLE" $CORE_SCRIPT redeploy $STANDS; then
+            echo "✖ Переразвёртывание выполнено не полностью. См. результат выше."
+        fi
         echo -e "\n---------------------------------------------------"
         read -n 1 -s -r -p "Операция завершена. Нажми любую клавишу для возврата в меню..."
         continue
