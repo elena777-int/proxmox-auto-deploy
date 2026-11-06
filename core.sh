@@ -1,5 +1,5 @@
 #!/bin/bash
-SPETSNAZ_VERSION="0.7.9 (2026-10-20)"
+SPETSNAZ_VERSION="0.7.12 (2026-11-04)"
 NODE=$(hostname -s)
 
 # Параметры экспертного доступа и APT-кэша (переопределяются в spetsnaz.conf)
@@ -188,7 +188,7 @@ revoke_net_access() {
 }
 
 ensure_ovs_flows() {
-    local base_id=$1 i tries br
+    local base_id=$1 i tries br failed=0
     for i in 9 10; do
         br="vmbr$((base_id + i))"
         tries=0
@@ -197,9 +197,11 @@ ensure_ovs_flows() {
         done
         ovs-ofctl add-flow "$br" "table=0, dl_dst=01:80:c2:00:00:02, actions=flood" >/dev/null 2>&1
         if ! ovs-ofctl dump-flows "$br" 2>/dev/null | grep -q "01:80:c2:00:00:02"; then
-            echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: не удалось добавить правило LACP на $br. Повторите: ovs-ofctl add-flow $br \"table=0, dl_dst=01:80:c2:00:00:02, actions=flood\"${C_NC}"
+            echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: не удалось добавить правило LACP на $br.${C_NC}"
+            failed=1
         fi
     done
+    return "$failed"
 }
 
 # Диск с дополнительными материалами для модуля: «имя_ISO|роли через пробел»; пусто — модулю не нужен
@@ -322,21 +324,127 @@ expand_ranges() {
     echo "${result[@]}"
 }
 
+# Снимок состояния кластера. Ошибки чтения не означают, что ID свободны.
+cluster_vms() {
+    pvesh get /cluster/resources --type vm --output-format json | jq -ce 'if type == "array" then . else error("VM inventory") end'
+}
+
+network_inventory() {
+    pvesh get "/nodes/$NODE/network" --output-format json | jq -ce 'if type == "array" then . else error("network inventory") end'
+}
+
+pool_inventory() {
+    pvesh get /pools --output-format json | jq -ce 'if type == "array" then . else error("pool inventory") end'
+}
+
 get_next_free_hundred() {
-    local base=10000 used_ids
-    # ID занятых ВМ берём по всему кластеру (qm list показывает только текущий узел)
-    used_ids=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | grep -Po '"vmid":\K\d+')
-    [ -z "$used_ids" ] && used_ids=$(qm list | awk 'NR>1 {print $1}')
-    while true; do
-        local conflict=0
-        for vmid in $used_ids; do
-            if [ "$vmid" -ge "$base" ] && [ "$vmid" -lt $((base + 100)) ]; then
-                conflict=1; break
-            fi
-        done
-        if [ $conflict -eq 0 ]; then echo $base; return; fi
-        base=$((base + 100))
+    local base=10000 ids nets pools occupied net_bases pool_bases
+    ids=$(cluster_vms) && nets=$(network_inventory) && pools=$(pool_inventory) || return 1
+    occupied=$(jq -r '.[].vmid | tonumber | (. / 100 | floor) * 100' <<< "$ids") || return 1
+    net_bases=$(jq -r '.[].iface | select(test("^vmbr[0-9]+$")) | ltrimstr("vmbr") | tonumber | (. / 100 | floor) * 100' <<< "$nets") || return 1
+    pool_bases=$(jq -r '.[].comment // "" | capture("^spetsnaz-v1:[^:]+:(?<base>[0-9]+):") | .base' <<< "$pools") || return 1
+    occupied+=$'\n'$net_bases$'\n'$pool_bases
+    while grep -Fxq "$base" <<< "$occupied"; do base=$((base + 100)); done
+    [ "$base" -le 999999900 ] || return 1
+    printf '%s\n' "$base"
+}
+
+# Метка хранится в пуле и каждом созданном мосту. Старые мосты не помечаются задним числом.
+read_stand_owner() {
+    local comment=$1
+    [[ "$comment" =~ ^spetsnaz-v1:([a-zA-Z0-9.-]+):([0-9]{5,9}):([a-f0-9]{32})$ ]] || return 1
+    STAND_NODE=${BASH_REMATCH[1]} STAND_BASE=${BASH_REMATCH[2]} STAND_TOKEN=${BASH_REMATCH[3]}
+}
+
+bridge_type_for() {
+    case "$MOD_TYPE" in
+        DEMO*) [ "$1" -eq 3 ] && { echo OVSBridge; return; } ;;
+        REG_*|MOD_*|GOLD_*) [ "$1" -ge 9 ] && { echo OVSBridge; return; } ;;
+    esac
+    echo bridge
+}
+
+bridge_is_owned() {
+    jq -e --arg iface "$2" --arg owner "$3" --arg type "$4" '
+        any(.[]; .iface == $iface and .type == $type and
+            ((.comments // "") | sub("\n$"; "")) == $owner and
+            ([.bridge_ports, .ovs_ports, .address, .address6, .cidr, .cidr6] | all(. == null or . == "")))
+    ' >/dev/null <<< "$1"
+}
+
+apply_stand_network() {
+    local upid status tries
+    upid=$(pvesh set "/nodes/$NODE/network" --output-format json | jq -er 'strings | select(startswith("UPID:"))') || return 1
+    for ((tries=0; tries<90; tries++)); do
+        status=$(pvesh get "/nodes/$NODE/tasks/$upid/status" --output-format json) || return 1
+        if jq -e '.status == "stopped"' >/dev/null <<< "$status"; then
+            if jq -e '.exitstatus == "OK"' >/dev/null <<< "$status"; then return 0; fi
+            echo "✖ Применение сети завершилось ошибкой: $(jq -r '.exitstatus // "нет статуса"' <<< "$status")" >&2
+            return 1
+        fi
+        sleep 1
     done
+    echo "Истекло время ожидания применения сетевой конфигурации." >&2
+    return 1
+}
+
+stand_network() {
+    local mode=$1 base=$2 owner=$3 nets bridge type i
+    local -a changes=()
+    nets=$(network_inventory) || return 1
+    for i in {1..10}; do
+        bridge="vmbr$((base+i))"
+        type=$(bridge_type_for "$i")
+        if [[ "$mode" == create || "$mode" == verify ]] && [ "$bridge" = "$WAN_BR" ]; then
+            echo "✖ $bridge зарезервирован для внутренней сети и не может быть WAN стенда." >&2
+            return 1
+        fi
+        if jq -e --arg iface "$bridge" 'any(.[]; .iface == $iface)' >/dev/null <<< "$nets"; then
+            if ! bridge_is_owned "$nets" "$bridge" "$owner" "$type"; then
+                echo "✖ Мост $bridge уже занят или изменён. Мост оставлен без изменений." >&2
+                return 1
+            fi
+            if [ "$mode" = delete ]; then
+                changes+=("$i")
+            elif [[ "$mode" == verify || "$mode" == create ]] && ! ip link show dev "$bridge" >/dev/null 2>&1; then
+                echo "✖ Мост стенда $bridge не активирован на узле." >&2
+                return 1
+            fi
+        elif ip link show dev "$bridge" >/dev/null 2>&1; then
+            echo "✖ Интерфейс $bridge уже существует вне списка сети Proxmox." >&2
+            return 1
+        elif [ "$mode" = verify ]; then
+            echo "✖ Мост стенда $bridge не найден." >&2
+            return 1
+        elif [ "$mode" = create ]; then
+            changes+=("$i")
+        fi
+    done
+    if [ -e /etc/network/interfaces.new ]; then
+        echo "✖ На узле есть неприменённые сетевые изменения. Проверьте их в Proxmox и повторите операцию." >&2
+        return 1
+    fi
+    [ "${#changes[@]}" -gt 0 ] || return 0
+    for i in "${changes[@]}"; do
+        bridge="vmbr$((base+i))"
+        if [ "$mode" = delete ]; then
+            nets=$(network_inventory) && bridge_is_owned "$nets" "$bridge" "$owner" "$(bridge_type_for "$i")" || return 1
+            local cfg
+            for cfg in /etc/pve/nodes/"$NODE"/{qemu-server,lxc}/*.conf; do
+                [ -f "$cfg" ] || continue
+                if grep -Eq "(^|,)bridge=$bridge(,|$)" "$cfg"; then
+                    echo "✖ $bridge ещё используется: ${cfg##*/}. Мост оставлен на месте." >&2
+                    return 1
+                fi
+            done
+            pvesh delete "/nodes/$NODE/network/$bridge" || return 1
+        else
+            pvesh create "/nodes/$NODE/network" --iface "$bridge" --type "$(bridge_type_for "$i")" \
+                --autostart 1 --comments "$owner" || return 1
+        fi
+    done
+    apply_stand_network || return 1
+    if [ "$mode" = create ]; then stand_network verify "$base" "$owner"; fi
 }
 
 # Имя ВМ для роли (имя образа может совпадать с любым из двух)
@@ -351,13 +459,11 @@ role_label() {
 # Раскладка ВМ стенда: строки "смещение#роль#адаптеры". Используется деплоем и оценкой места.
 stand_vm_list() {
     local br=$1 s=$2
-    local mac_stand_byte
-    mac_stand_byte=$(printf '%02X' $((10#$s % 256)))
 
     local vms=()
     if [[ "$MOD_TYPE" == DEMO* ]]; then
         vms=(
-            "1#ISP#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:01 net1:vmbr$((br+1)) net2:vmbr$((br+2))"
+            "1#ISP#net0:$WAN_BR net1:vmbr$((br+1)) net2:vmbr$((br+2))"
             "2#HQ-RTR#net0:$WAN_BR,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+3))"
             "3#BR-RTR#net0:$WAN_BR,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+4))"
             "4#BR-FW#net0:vmbr$((br+4)) net1:vmbr$((br+5))"
@@ -369,12 +475,12 @@ stand_vm_list() {
         vms=(
             "1#PROV-GW#net0:vmbr$((br+9)) net1:vmbr$((br+10))"
             "2#PROV-SW#net0:vmbr$((br+8)) net1:vmbr$((br+9)) net2:vmbr$((br+10))"
-            "3#COD-GW#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:03,link_down=1 net1:vmbr$((br+4)) net2:vmbr$((br+5))"
-            "4#GW-1#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:04,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+4))"
-            "5#GW-2#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:05,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+6))"
-            "6#GW-3#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:06,link_down=1 net1:vmbr$((br+3)) net2:vmbr$((br+8))"
+            "3#COD-GW#net0:$WAN_BR,link_down=1 net1:vmbr$((br+4)) net2:vmbr$((br+5))"
+            "4#GW-1#net0:$WAN_BR,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+4))"
+            "5#GW-2#net0:$WAN_BR,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+6))"
+            "6#GW-3#net0:$WAN_BR,link_down=1 net1:vmbr$((br+3)) net2:vmbr$((br+8))"
             "7#ZSPD-FW#net0:vmbr$((br+7))"
-            "8#GW-CORE#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:08 net1:vmbr$((br+1)) net2:vmbr$((br+2)) net3:vmbr$((br+3))"
+            "8#GW-CORE#net0:$WAN_BR net1:vmbr$((br+1)) net2:vmbr$((br+2)) net3:vmbr$((br+3))"
             "9#ZSPD-SW#net0:vmbr$((br+6)) net1:vmbr$((br+7))"
             "10#COD-SRV-1#net0:vmbr$((br+5)) net1:vmbr$((br+5))"
             "11#COD-SRV-2#net0:vmbr$((br+5))"
@@ -386,33 +492,56 @@ stand_vm_list() {
     printf '%s\n' "${vms[@]}"
 }
 
-patch_net() {
-    local v_id=$1; local iface=$2; local target=$3
-    local current=$(qm config $v_id | grep "^${iface}:" | sed "s/^${iface}:\s*//")
-    if [ -z "$current" ]; then
-        echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: В шаблоне ВМ $v_id отсутствует адаптер $iface! Сеть $target не подключена.${C_NC}" >&2
-        return
-    fi
+# Локальный unicast MAC. VMID уникален в кластере; номер стенда может повторяться.
+wan_mac() {
+    local vid=$1
+    printf '02:53:%02X:%02X:%02X:%02X' "$((vid>>24 & 255))" "$((vid>>16 & 255))" "$((vid>>8 & 255))" "$((vid & 255))"
+}
 
-    local new_bridge=$(echo "$target" | cut -d',' -f1)
-    local patched=$(echo "$current" | sed -E "s/bridge=[^,]+/bridge=$new_bridge/")
+net_value() {
+    local vid=$1 current=$2 target=$3 bridge opt item head vlan down=0
+    local -a spec old
+    IFS=, read -ra spec <<< "$target"
+    IFS=, read -ra old <<< "$current"
+    bridge=${spec[0]}
+    head=${old[0]}
+    [[ "$bridge" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}$ && "$head" =~ ^[a-zA-Z0-9_]+(=([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})?$ ]] || return 1
+    if [ "$bridge" = "$WAN_BR" ]; then head="${head%%=*}=$(wan_mac "$vid")"; fi
+    for item in "${old[@]:1}"; do
+        case "$item" in bridge=*|tag=*|trunks=*|link_down=*) ;; *) head+=",$item" ;; esac
+    done
+    for opt in "${spec[@]:1}"; do
+        case "$opt" in
+            link_down=1) down=1 ;;
+            tag=*) vlan=${opt#tag=}; [[ "$vlan" =~ ^[0-9]{1,4}$ ]] && ((10#$vlan >= 1 && 10#$vlan <= 4094)) || return 1; head+=",tag=$((10#$vlan))" ;;
+            *) return 1 ;;
+        esac
+    done
+    # Для отключённого WAN одного link_down недостаточно: не привязываем адаптер к внешнему мосту.
+    if [ "$bridge" != "$WAN_BR" ] || [ "$down" -eq 0 ]; then head+=",bridge=$bridge"; fi
+    printf '%s,link_down=%s\n' "$head" "$down"
+}
 
-    if [[ "$target" == *"tag="* ]]; then
-        local new_tag=$(echo "$target" | grep -o 'tag=[0-9]*')
-        if [[ "$patched" == *"tag="* ]]; then
-            patched=$(echo "$patched" | sed -E "s/tag=[0-9]+/$new_tag/")
-        else
-            patched="$patched,$new_tag"
+configure_stand_net() {
+    local vid=$1 rules=$2 cfg rule iface current patched extra remove="" status
+    local -a args=()
+    status=$(qm status "$vid") && [ "$status" = "status: stopped" ] || return 1
+    cfg=$(qm config "$vid") || return 1
+    for rule in $rules; do
+        iface=${rule%%:*}
+        current=$(awk -v key="$iface:" '$1 == key {print $2; exit}' <<< "$cfg")
+        if ! patched=$(net_value "$vid" "$current" "${rule#*:}"); then
+            echo "✖ ВМ $vid: нет корректного адаптера $iface для ${rule#*:}." >&2
+            return 1
         fi
-    fi
-
-    if [[ "$target" == *"macaddr="* ]]; then
-        local new_mac=$(echo "$target" | sed -E 's/.*macaddr=([0-9a-fA-F:]+).*/\1/')
-        patched=$(echo "$patched" | sed -E "s/[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}/$new_mac/")
-    fi
-    if [[ "$target" == *"link_down=1"* ]] && [[ "$patched" != *"link_down="* ]]; then patched="$patched,link_down=1"; fi
-
-    qm set $v_id --$iface "$patched" >/dev/null 2>&1
+        args+=("--$iface" "$patched")
+    done
+    # Лишние адаптеры из бэкапа могут вести на чужие мосты.
+    while read -r extra; do
+        [[ " $rules " == *" $extra:"* ]] || remove+="${remove:+,}$extra"
+    done < <(awk -F: '/^net[0-9]+:/ {print $1}' <<< "$cfg")
+    [ -z "$remove" ] || args+=(--delete "$remove")
+    qm set "$vid" "${args[@]}"
 }
 
 # ===================== Память и ядра ВМ по ролям (необязательно) =====================
@@ -465,14 +594,11 @@ add_extra_disks() {
     [ "$cnt" -gt 0 ] || return 0
     cfg=$(qm config "$vid" 2>/dev/null)
     first=$(echo "$cfg" | grep -E '^(scsi|virtio|sata|ide)[0-9]+: ' | grep -v 'media=cdrom' | head -n 1)
-    [ -z "$first" ] && return 0
+    [ -n "$first" ] || { echo "✖ HQ-SRV: не найден основной диск." >&2; return 1; }
     have=$(echo "$cfg" | grep -E '^(scsi|virtio|sata|ide)[0-9]+: ' | grep -vc 'media=cdrom')
-    if [ "$have" -gt 1 ]; then
-        echo -e "      у HQ-SRV в образе уже $have диска(ов): основной и дополнительных — $((have - 1)); новые не добавляю"
-        return 0
-    fi
+    [ "$have" -ge $((cnt+1)) ] && return 0
     bus=$(echo "$first" | sed -E 's/^([a-z]+)[0-9]+:.*/\1/')
-    need=$cnt
+    need=$((cnt+1-have))
     for i in $(seq 0 30); do
         [ "$need" -eq 0 ] && break
         [ "$bus" = "ide" ] && [ "$i" -gt 3 ] && break
@@ -484,157 +610,200 @@ add_extra_disks() {
         fi
     done
     [ "$added" -gt 0 ] && echo -e "      HQ-SRV: добавлено дисков для RAID — $added по $size ГБ (параметр HQSRV_EXTRA_DISKS)"
-    return 0
+    [ "$need" -eq 0 ]
 }
 
-# Восстановить одну ВМ роли из образа модуля и подготовить её как при деплое:
-# сети стенда, ISO, метки, пул, Day0. Код: 0 — готово; 1 — образ не найден; 2 — ошибка восстановления.
-restore_vm() {
-    local vid=$1 name=$2 nets_config=$3 pool=$4 pve_tag=$5
-    local vm_label full_archive_path out net_rule snap_err
-    vm_label=$(role_label "$name")
-    full_archive_path=$(find_image "$name" "$vm_label")
+pool_info() {
+    pvesh get "/pools/$1" --output-format json | jq -ce 'select(type == "object" and (.members | type == "array"))'
+}
 
-    if [ -z "$full_archive_path" ] || [ ! -f "$full_archive_path" ]; then
-        local search_dir
-        IFS='|' read -r search_dir _ _ <<< "$(resolve_img_dir)"
-        echo -e "${C_YELLOW}⚠ ВНИМАНИЕ: Образ для ${name} не найден в ${search_dir}! Пропускаю ВМ.${C_NC}"
+pool_owns_vm() {
+    jq -e --argjson id "$2" --arg node "$NODE" '
+        any(.members[]; .type == "qemu" and .vmid == $id and .node == $node)
+    ' >/dev/null <<< "$1"
+}
+
+vm_id_in_use() {
+    jq -e --argjson id "$2" 'any(.[]; .vmid == $id)' >/dev/null <<< "$1"
+}
+
+vm_ready() {
+    local cfg
+    cfg=$(qm config "$1") || return 1
+    awk '/^tags:/ {print $2}' <<< "$cfg" | tr ';,' '\n' | grep -Fxq "spz-ready-$2" &&
+        snap_exists "$1" Day0
+}
+
+restore_new_vm() {
+    local vid=$1 archive=$2 pool=$3 out cfg status
+    # --pool добавляет ВМ к пулу при успешном восстановлении. Никогда не перезаписываем занятый ID.
+    if ! out=$( (set -o pipefail; zstdcat "$archive" | qmrestore - "$vid" --storage "$TARGET_STORAGE" --pool "$pool") 2>&1 ); then
+        echo "✖ ВМ $vid: восстановление не удалось. $(tail -n 3 <<< "$out" | tr '\n' ' ')" >&2
+        # Эта диагностика идёт от уже запущенного воркера qmrestore. При
+        # коллизии ID CLI отказывает до его запуска. Стираем только пустую
+        # заглушку нашего неудачного восстановления, без обхода блокировок.
+        if [[ "$out" == *"some or all disks were not completely restored. VM $vid state is NOT cleaned up."* ]]; then
+            if cfg=$(qm config "$vid") && [[ -z "$cfg" || "$cfg" == "memory: 128" ]] &&
+                status=$(qm status "$vid") && [ "$status" = "status: stopped" ] && qm destroy "$vid"; then
+                echo "  Пустая запись ВМ $vid после сбоя удалена; роль можно повторить." >&2
+            else
+                echo "  ВМ $vid не удалена автоматически. Проверьте её конфигурацию перед повтором." >&2
+            fi
+        fi
         return 1
     fi
-
-    local rt0=$SECONDS
-    if ! out=$(zstdcat "$full_archive_path" | qmrestore - "$vid" --storage "$TARGET_STORAGE" --force 1 2>&1); then
-        echo -e "    ${C_RED}✖ $vm_label (ID: $vid): восстановление не удалось: $(echo "$out" | grep -v '^progress' | tail -n 2 | tr '\n' ' ')${C_NC}"
-        return 2
-    fi
-    qm set $vid --name "$vm_label" >/dev/null 2>&1
-
-    local rdt=$((SECONDS - rt0))
-    echo -e "    ${C_GREEN}✔ Боевая единица $vm_label (ID: $vid) успешно развернута! Образ: ${full_archive_path#$IMG_DIR/} (за $((rdt / 60)) мин $((rdt % 60)) с)${C_NC}"
-
-    # Диск с дополнительными материалами (iso_spec): DEMO_1 — не нужен; DEMO_2/DEMO_3/DEMO_GOLD — Additional_de.iso к HQ-SRV и BR-SRV (по заданию; HQ-CLI диск не нужен);
-    # REG/MOD/GOLD — Additional_rc.iso к COD-ADMIN. Если ISO нет — предупреждение и счётчик ISO_MISSING (итог в конце деплоя)
-    local ispec=$(iso_spec)
-    if [ -n "$ispec" ] && [[ " ${ispec#*|} " == *" $name "* ]]; then
-        attach_iso "$vid" "${ispec%%|*}"
-    fi
-    if [[ "$MOD_TYPE" == DEMO_2 || "$MOD_TYPE" == DEMO_3 || "$MOD_TYPE" == DEMO_T2 || "$MOD_TYPE" == DEMO_T3 || "$MOD_TYPE" == DEMO_GOLD ]]; then
-        [ "$name" == "HQ-SRV" ] && add_extra_disks "$vid"
-    fi
-
-    for net_rule in $nets_config; do
-        patch_net $vid "${net_rule%%:*}" "${net_rule#*:}"
-    done
-
-    qm set $vid --tags "$pve_tag" >/dev/null 2>&1
-    pvesh set /pools/$pool -vms $vid >/dev/null 2>&1
-    qm set $vid --tablet 1 --vga qxl >/dev/null 2>&1
-    [ "${RES_APPLY:-0}" = "1" ] && apply_resources "$vid" "$name"
-
-    sleep 1; qm unlock $vid >/dev/null 2>&1
-    if ! snap_exists "$vid" "Day0"; then
-        snap_err=$(qm snapshot $vid "Day0" --description "Чистый старт стенда" 2>&1) || echo -e "    ${C_YELLOW}⚠ VM $vid: снапшот Day0 не создан: $(echo "$snap_err" | tail -n 1)${C_NC}"
-    fi
-    return 0
 }
 
-# Переразвернуть одну машину стенда из образа модуля (поломанная ВМ, другая версия образа).
-# VLAN-метки берутся из снапшота Day0 этой ВМ (если его нет — из текущей конфигурации), хранилище — то, где лежит её диск.
-redeploy_vm() {
-    local s=$1 role=$2 pool="${MOD_TYPE}_S$1" base line off name nets vid label cur src rule iface target tag new_nets="" st=""
-    base=$(stand_base_id "$pool")
-    if [ -z "$base" ]; then
-        echo -e "${C_RED}✖ Стенд $s ($pool) не найден или пуст.${C_NC}"; return 1
+finish_vm() {
+    local vid=$1 role=$2 rules=$3 tag=$4 token=$5 label spec rc
+    label=$(role_label "$role")
+    qm set "$vid" --onboot 0 || return 1
+    configure_stand_net "$vid" "$rules" || return 1
+    qm set "$vid" --name "$label" --tablet 1 --vga qxl || return 1
+    spec=$(iso_spec)
+    if [ -n "$spec" ] && [[ " ${spec#*|} " == *" $role "* ]]; then
+        attach_iso "$vid" "${spec%%|*}"; rc=$?
+        # Отсутствующий ISO уже показывается отдельным предупреждением.
+        [ "$rc" -le 1 ] || return 1
     fi
-    pool_check_single "$pool" || return 1
-    VLAN_1=${VLAN_1:-100}; VLAN_2=${VLAN_2:-200}
-    line=$(stand_vm_list "$base" "$s" | awk -F'#' -v r="$role" '$2 == r')
-    if [ -z "$line" ]; then
-        echo -e "${C_RED}✖ В модуле $MOD_TYPE нет роли $role.${C_NC}"; return 1
+    case "$MOD_TYPE:$role" in
+        DEMO_2:HQ-SRV|DEMO_3:HQ-SRV|DEMO_T2:HQ-SRV|DEMO_T3:HQ-SRV|DEMO_GOLD:HQ-SRV)
+            add_extra_disks "$vid" || return 1 ;;
+    esac
+    if [ "${RES_APPLY:-0}" = 1 ]; then apply_resources "$vid" "$role" || return 1; fi
+    qm set "$vid" --tags "$tag,spz-ready-$token" || return 1
+    if ! snap_exists "$vid" Day0; then
+        qm snapshot "$vid" Day0 --description "Чистый старт стенда" || return 1
     fi
-    IFS='#' read -r off name nets <<< "$line"
-    vid=$((base + off)); label=$(role_label "$name")
+}
 
-    if qm config "$vid" >/dev/null 2>&1; then
-        cur=$(qm config "$vid" 2>/dev/null | awk '/^name:/{print $2; exit}')
-        if [ -n "$cur" ] && [ "$cur" != "$label" ] && [ "$cur" != "$name" ]; then
-            echo -e "${C_RED}✖ Стенд $s: ВМ $vid называется '$cur', ожидалась $label — ничего не меняю.${C_NC}"; return 1
+stand_account() {
+    local s=$1 pool=$2 owner=$3 account users comment pass
+    setup_pve_roles || return 1
+    account="${MOD_TYPE,,}"; account="${account//_/-}-s${s}@pve"
+    users=$(pvesh get /access/users --output-format json) || return 1
+    comment=$(jq -r --arg user "$account" '.[] | select(.userid == $user) | .comment // ""' <<< "$users") || return 1
+    if jq -e --arg user "$account" 'any(.[]; .userid == $user)' >/dev/null <<< "$users"; then
+        if [ "$comment" != "$owner" ]; then
+            echo "✖ Учётная запись $account существует и не принадлежит стенду." >&2
+            return 1
         fi
-        src=$(qm config "$vid" --snapshot Day0 2>/dev/null)
-        [ -z "$src" ] && src=$(qm config "$vid" 2>/dev/null)
+        if awk -F, -v user="$account" '$2 == user {found=1} END {exit !found}' "$CSV_FILE"; then return 0; fi
+        pass=$(gen_password 8)
+        pvesh set /access/password --userid "$account" --password "$pass" >/dev/null || return 1
+    else
+        pass=$(gen_password 8)
+        pveum user add "$account" --comment "$owner" --password "$pass" || return 1
+    fi
+    pveum acl modify "/pool/$pool" -users "$account" -roles Participant_RC || return 1
+    printf 'Стенд %s (%s),%s,%s\n' "$s" "$MOD_TYPE" "$account" "$pass" >> "$CSV_FILE"
+}
+
+redeploy_vm() {
+    local s=$1 role=$2 pool="${MOD_TYPE}_S$1" info owner line off name nets vid label cur src rule iface target tag new_nets="" st="" ids archive
+    info=$(pool_info "$pool") || return 1
+    owner=$(jq -r '.comment // ""' <<< "$info") || return 1
+    if ! read_stand_owner "$owner" || [ "$STAND_NODE" != "$NODE" ]; then
+        echo "✖ $pool: переразвёртывание доступно только для стенда с подтверждённой сетью на этом узле." >&2
+        return 1
+    fi
+    stand_network verify "$STAND_BASE" "$owner" || return 1
+    line=$(stand_vm_list "$STAND_BASE" "$s" | awk -F'#' -v r="$role" '$2 == r')
+    [ -n "$line" ] || { echo "✖ Неизвестная роль $role." >&2; return 1; }
+    IFS='#' read -r off name nets <<< "$line"
+    vid=$((STAND_BASE + off)); label=$(role_label "$name")
+    archive=$(find_image "$name" "$label")
+    if [ ! -s "$archive" ]; then echo "✖ Образ $label не найден или пуст." >&2; return 1; fi
+
+    ids=$(cluster_vms) || return 1
+    if vm_id_in_use "$ids" "$vid"; then
+        if ! pool_owns_vm "$info" "$vid"; then
+            echo "✖ ID $vid занят ВМ вне пула $pool на этом узле." >&2
+            return 1
+        fi
+        cur=$(qm config "$vid") || return 1
+        [ "$(awk '/^name:/ {print $2; exit}' <<< "$cur")" = "$label" ] || return 1
+        src=$(qm config "$vid" --snapshot Day0 2>/dev/null) || src=$cur
         for rule in $nets; do
             iface=${rule%%:*}; target=${rule#*:}
-            tag=$(echo "$src" | grep "^${iface}:" | grep -oP 'tag=\K[0-9]+')
-            if [[ "$target" == *tag=* ]] && [ -n "$tag" ]; then target=$(echo "$target" | sed -E "s/tag=[0-9]*/tag=$tag/"); fi
+            tag=$(grep "^$iface:" <<< "$src" | grep -oP 'tag=\K[0-9]+')
+            if [[ "$target" == *tag=* ]] && [ -n "$tag" ]; then target=${target%tag=*}tag=$tag; fi
             new_nets+="$iface:$target "
         done
         nets=$new_nets
-        st=$(qm config "$vid" 2>/dev/null | grep -E '^(scsi|sata|virtio|ide)[0-9]+: ' | grep -v 'media=cdrom' | head -n 1 | sed -E 's/^[a-z]+[0-9]+: ([^:,]+):.*/\1/')
-        echo -e "  Стенд $s: $label (ID $vid) — останавливаю и удаляю вместе со снапшотами..."
-        qm stop "$vid" >/dev/null 2>&1; sleep 1
-    else
-        echo -e "  Стенд $s: ВМ $label (ID $vid) отсутствует — будет создана."
+        st=$(grep -E '^(scsi|sata|virtio|ide)[0-9]+: ' <<< "$cur" | grep -v 'media=cdrom' | head -n 1 | sed -E 's/^[a-z]+[0-9]+: ([^:,]+):.*/\1/')
+        # Проверяем архив до необратимой замены.
+        zstd -tq -- "$archive" || return 1
+        if [ "$(qm status "$vid")" != "status: stopped" ]; then qm stop "$vid" || return 1; fi
+        info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 1
+        qm destroy "$vid" || return 1
     fi
-
-    TARGET_STORAGE="${st:-$TARGET_STORAGE}" restore_vm "$vid" "$name" "$nets" "$pool" "${MOD_TYPE,,},stand_$s"
+    TARGET_STORAGE="${st:-$TARGET_STORAGE}" restore_new_vm "$vid" "$archive" "$pool" || return 1
+    info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 1
+    finish_vm "$vid" "$name" "$nets" "${MOD_TYPE,,},stand_$s" "$STAND_TOKEN"
 }
 
 deploy_from_images() {
-    local s=$1; local b_id=$2; local mod_type=$3; local br=$b_id
-    local suffix="$mod_type"; local pool="${suffix}_S${s}"; local pve_tag="${mod_type,,},stand_$s"
-
-    pvesh get /pools/$pool >/dev/null 2>&1 || pvesh create /pools --poolid $pool --comment "Stand $suffix - $s" >/dev/null
-
-    local mod_lower=$(echo "$MOD_TYPE" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
-    USER="${mod_lower}-s${s}@pve"
-    PASS=$(gen_password 8)
-
-    if ! pveum user list | grep -q "$USER"; then pveum user add $USER >/dev/null 2>&1; fi
-    pvesh set /access/password --userid "$USER" --password "$PASS" >/dev/null 2>&1
-    pveum acl modify /pool/$pool -users $USER -roles Participant_RC >/dev/null
-
-    echo "Стенд $s ($suffix),$USER,$PASS" >> "$CSV_FILE"
-    chmod 600 "$CSV_FILE" 2>/dev/null
-
-    for i in {1..10}; do
-        local bridge="vmbr$((br+i))"
-        local is_ovs=0
-
-        if [[ "$MOD_TYPE" == REG_* || "$MOD_TYPE" == MOD_* || "$MOD_TYPE" == GOLD_* ]] && [[ "$i" -ge 9 && "$i" -le 10 ]]; then is_ovs=1; fi
-        if [[ "$MOD_TYPE" == DEMO* ]] && [ "$i" -eq 3 ]; then is_ovs=1; fi
-
-        if pvesh get /nodes/$NODE/network/$bridge >/dev/null 2>&1; then
-            local bridge_type=$(pvesh get /nodes/$NODE/network/$bridge --output-format json | grep -Po '"type":"\K[^"]+')
-            if [ "$is_ovs" -eq 1 ] && [ "$bridge_type" != "OVSBridge" ]; then
-                pvesh delete /nodes/$NODE/network/$bridge >/dev/null 2>&1
-            fi
+    local s=$1 pool="${MOD_TYPE}_S$1" owner info ids pools token base line off name rules vid archive failed=0 exists=0
+    local -a vms=()
+    local -A archives=()
+    pools=$(pool_inventory) || return 1
+    if jq -e --arg pool "$pool" 'any(.[]; .poolid == $pool)' >/dev/null <<< "$pools"; then
+        exists=1
+        info=$(pool_info "$pool") || return 1
+        owner=$(jq -r '.comment // ""' <<< "$info") || return 1
+        if ! read_stand_owner "$owner" || [ "$STAND_NODE" != "$NODE" ]; then
+            echo "✖ $pool: существующий пул без метки этого узла. Пул оставлен без изменений." >&2
+            return 1
         fi
-
-        if ! pvesh get /nodes/$NODE/network/$bridge >/dev/null 2>&1; then
-            if [ "$is_ovs" -eq 1 ]; then
-                pvesh create /nodes/$NODE/network --iface $bridge --type OVSBridge --autostart 1 >/dev/null 2>&1
-            else
-                pvesh create /nodes/$NODE/network --iface $bridge --type bridge --autostart 1 >/dev/null 2>&1
-            fi
-        fi
-    done
-
-    pvesh set /nodes/$NODE/network >/dev/null 2>&1
-
-    if [[ "$MOD_TYPE" == REG_* || "$MOD_TYPE" == MOD_* || "$MOD_TYPE" == GOLD_* ]]; then
-        ensure_ovs_flows "$br"
+        base=$STAND_BASE token=$STAND_TOKEN
+    else
+        base=$(get_next_free_hundred) || return 1
+        token=$(tr -d '-' </proc/sys/kernel/random/uuid) || return 1
+        owner="spetsnaz-v1:$NODE:$base:$token"
     fi
-
-    local vms=()
-    mapfile -t vms < <(stand_vm_list "$br" "$s")
-
-    for vm in "${vms[@]}"; do
-        local off name nets_config vid
-        IFS='#' read -r off name nets_config <<< "$vm"
-        vid=$((b_id + off))
-        restore_vm "$vid" "$name" "$nets_config" "$pool" "$pve_tag"
-        [ $? -eq 1 ] && DEPLOY_SKIPPED=$((DEPLOY_SKIPPED + 1))
+    mapfile -t vms < <(stand_vm_list "$base" "$s")
+    ids=$(cluster_vms) || return 1
+    # Проверяем все требуемые образы и конфликты до первого изменения.
+    for line in "${vms[@]}"; do
+        IFS='#' read -r off name rules <<< "$line"
+        vid=$((base+off))
+        if vm_id_in_use "$ids" "$vid"; then
+            if ! pool_owns_vm "$info" "$vid"; then
+                echo "✖ $name: ID $vid занят другой ВМ." >&2
+                failed=1
+            fi
+        else
+            archive=$(find_image "$name" "$(role_label "$name")")
+            if [ ! -s "$archive" ]; then echo "✖ $name: образ отсутствует или пуст." >&2; failed=1
+            else archives[$vid]=$archive; fi
+        fi
     done
+    [ "$failed" -eq 0 ] || return 1
+    if [ "$exists" -eq 0 ]; then
+        pvesh create /pools --poolid "$pool" --comment "$owner" || return 1
+    fi
+    stand_network create "$base" "$owner" || return 1
+    case "$MOD_TYPE" in REG_*|MOD_*|GOLD_*) ensure_ovs_flows "$base" || return 1 ;; esac
+
+    for line in "${vms[@]}"; do
+        IFS='#' read -r off name rules <<< "$line"
+        vid=$((base+off))
+        if [ -n "${archives[$vid]}" ]; then
+            if ! restore_new_vm "$vid" "${archives[$vid]}" "$pool"; then failed=1; continue; fi
+        elif vm_ready "$vid" "$token"; then
+            echo "  ✔ $name ($vid): уже готова."
+            continue
+        fi
+        if info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" &&
+            finish_vm "$vid" "$name" "$rules" "${MOD_TYPE,,},stand_$s" "$token"; then
+            echo "  ✔ $name ($vid): готова."
+        else
+            echo "  ✖ $name ($vid): настройка не завершена." >&2
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] && stand_account "$s" "$pool" "$owner"
 }
 
 # --- Снапшоты: с проверкой существования и видимым результатом (раньше ошибки qm скрывались) ---
@@ -691,13 +860,78 @@ snap_op() {
     esac
 }
 
+stand_vms_ready() {
+    local s=$1 info=$2 off vid count=0
+    while IFS='#' read -r off _; do
+        vid=$((STAND_BASE+off))
+        pool_owns_vm "$info" "$vid" && vm_ready "$vid" "$STAND_TOKEN" || return 1
+        count=$((count+1))
+    done < <(stand_vm_list "$STAND_BASE" "$s")
+    jq -e --argjson count "$count" '[.members[] | select(.type == "qemu")] | length == $count' >/dev/null <<< "$info"
+}
+
+destroy_stand() {
+    local s=$1 pool=$2 info=$3 owner=$4 vid account expected="" off managed=0
+    local -a vmids=()
+    mapfile -t vmids < <(jq -r '.members[] | select(.type == "qemu") | .vmid' <<< "$info")
+    if read_stand_owner "$owner"; then
+        managed=1
+        [ "$STAND_NODE" = "$NODE" ] || { echo "✖ $pool принадлежит узлу $STAND_NODE." >&2; return 1; }
+        stand_network verify-delete "$STAND_BASE" "$owner" || return 1
+        while IFS='#' read -r off _; do expected+=" $((STAND_BASE+off)) "; done < <(stand_vm_list "$STAND_BASE" "$s")
+    fi
+    for vid in "${vmids[@]}"; do
+        if ! pool_owns_vm "$info" "$vid" || { [ "$managed" -eq 1 ] && [[ "$expected" != *" $vid "* ]]; }; then
+            echo "✖ $pool: не удалось подтвердить принадлежность ВМ $vid на этом узле." >&2
+            return 1
+        fi
+    done
+    for vid in "${vmids[@]}"; do
+        info=$(pool_info "$pool") && pool_owns_vm "$info" "$vid" || return 1
+        if [ "$(qm status "$vid")" != "status: stopped" ]; then qm stop "$vid" || return 1; fi
+        qm destroy "$vid" --purge 1 || return 1
+    done
+    account="${MOD_TYPE,,}"; account="${account//_/-}-s${s}@pve"
+    if [ "$managed" -eq 1 ]; then
+        stand_network delete "$STAND_BASE" "$owner" || return 1
+        local users
+        users=$(pvesh get /access/users --output-format json) || return 1
+        if jq -e --arg user "$account" --arg owner "$owner" \
+            'any(.[]; .userid == $user and .comment == $owner)' >/dev/null <<< "$users"; then
+            pveum user delete "$account" || return 1
+        fi
+        local i
+        for i in {1..10}; do
+            pveum acl delete "/sdn/zones/localnetwork/vmbr$((STAND_BASE+i))" -users "$account" -roles Participant_SDN >/dev/null 2>&1 || :
+        done
+    else
+        echo "⚠ $pool: старый стенд. Мосты и учётная запись без метки владельца оставлены для ручной проверки."
+    fi
+    info=$(pool_info "$pool") &&
+        jq -e '[.members[] | select(.type == "qemu" or .type == "lxc")] | length == 0' >/dev/null <<< "$info" || return 1
+    pvesh delete "/pools/$pool" || return 1
+    local f
+    for f in "$CSV_FILE" "$ROT_FILE"; do
+        [ ! -f "$f" ] || sed -i "/^Стенд $s ($MOD_TYPE),/d" "$f"
+    done
+    echo "✔ Стенд $s удалён."
+}
+
 manage_state() {
     local stands_list=($(expand_ranges "$@"))
+    local s pool_name pools vmid info owner failed=0
+    local -a pool_arr
     local tau_delay=${TAU_DELAY:-8}
     ADDR_PENDING=()
 
+    pools=$(pool_inventory) || return 1
     for s in "${stands_list[@]}"; do
-        mapfile -t pool_arr < <(pvesh get /pools --output-format json 2>/dev/null | grep -Po '"poolid":"\K[^"]+' | grep "^${MOD_TYPE}_S${s}$")
+        mapfile -t pool_arr < <(jq -r --arg pool "${MOD_TYPE}_S$s" '.[] | select(.poolid == $pool) | .poolid' <<< "$pools")
+        if [ "${#pool_arr[@]}" -eq 0 ]; then
+            echo "✖ Пул ${MOD_TYPE}_S$s не найден." >&2
+            failed=1
+            continue
+        fi
         for pool_name in "${pool_arr[@]}"; do
             if [[ "$ACTION" == "netperm_on" || "$ACTION" == "netperm_off" ]]; then
                 local mod_lower=$(echo "$MOD_TYPE" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
@@ -796,19 +1030,28 @@ manage_state() {
                 SPACE_TOTAL=$(( ${SPACE_TOTAL:-0} + su ))
                 continue
             fi
-            local vmids=$(pvesh get /pools/$pool_name --output-format json 2>/dev/null | grep -Po '"vmid":\K\d+')
+            local vmids
+            info=$(pool_info "$pool_name") || { failed=1; continue; }
+            vmids=$(jq -r '.members[] | select(.type == "qemu") | .vmid' <<< "$info") || { failed=1; continue; }
+            owner=$(jq -r '.comment // ""' <<< "$info") || { failed=1; continue; }
 
-            if [ "$ACTION" == "destroy" ]; then
-                local mod_lower_d=$(echo "$MOD_TYPE" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
-                revoke_net_access "$pool_name" "${mod_lower_d}-s${s}@pve"
-                echo -e "  Стенд $s ($pool_name):"
-                DESTROY_LEFT=0
+            if [ "$ACTION" = destroy ]; then
+                destroy_stand "$s" "$pool_name" "$info" "$owner" || failed=1
+                continue
             fi
-
-            if [ "$ACTION" == "start" ] && [ -n "$vmids" ]; then
-                if [[ "$MOD_TYPE" == REG_* || "$MOD_TYPE" == MOD_* || "$MOD_TYPE" == GOLD_* ]]; then
-                    local ovs_base=$(stand_base_id "$pool_name")
-                    [ -n "$ovs_base" ] && ensure_ovs_flows "$ovs_base"
+            if [ "$ACTION" = start ]; then
+                if read_stand_owner "$owner"; then
+                    if [ "$STAND_NODE" != "$NODE" ] ||
+                        ! stand_network verify "$STAND_BASE" "$owner" ||
+                        ! stand_vms_ready "$s" "$info"; then
+                        echo "✖ $pool_name: стенд не готов к запуску на этом узле. Повторите развёртывание." >&2
+                        failed=1; continue
+                    fi
+                    case "$MOD_TYPE" in
+                        REG_*|MOD_*|GOLD_*) ensure_ovs_flows "$STAND_BASE" || { failed=1; continue; } ;;
+                    esac
+                elif [[ "$MOD_TYPE" == REG_* || "$MOD_TYPE" == MOD_* || "$MOD_TYPE" == GOLD_* ]]; then
+                    echo "⚠ $pool_name: старый стенд. Проверьте правила LACP вручную."
                 fi
                 echo -e "${C_GREEN}Каскадный запуск стенда $s (τ = ${tau_delay} сек)...${C_NC}"
             fi
@@ -821,7 +1064,7 @@ manage_state() {
                 fi
                 case $ACTION in
                     start)
-                        qm start $vmid >/dev/null 2>&1
+                        qm start "$vmid" || { failed=1; continue; }
                         collect_wan_vm "$s" "$vmid"
                         sleep $tau_delay
                         ;;
@@ -834,55 +1077,14 @@ manage_state() {
                     reboot)
                         qm reboot $vmid >/dev/null 2>&1 &
                         ;;
-                    destroy)
-                        local dout
-                        qm stop $vmid --skiplock 1 >/dev/null 2>&1; sleep 1
-                        if ! dout=$(qm destroy $vmid --purge 1 --skiplock 1 2>&1); then
-                            sleep 3; qm stop $vmid --skiplock 1 >/dev/null 2>&1; sleep 1
-                            dout=$(qm destroy $vmid --purge 1 --skiplock 1 2>&1)
-                        fi
-                        if qm status $vmid >/dev/null 2>&1; then
-                            echo -e "    ${C_RED}✖ ВМ $vmid не удалена: $(echo "$dout" | tail -n 1)${C_NC}"
-                            DESTROY_LEFT=$((DESTROY_LEFT + 1))
-                        else
-                            echo -e "    ✔ ВМ $vmid удалена"
-                        fi
-                        ;;
                     snapshot|rollback|delsnap)
                         snap_op "$ACTION" "$vmid" "$SNAP_NAME"
                         ;;
                 esac
             done
 
-            if [ "$ACTION" == "destroy" ]; then
-                if [ "${DESTROY_LEFT:-0}" -gt 0 ]; then
-                    echo -e "    ${C_RED}✖ Стенд $s удалён не полностью (осталось ВМ: $DESTROY_LEFT) — пул, мосты и учётная запись сохранены. Повторите удаление этого стенда.${C_NC}"
-                    DESTROY_FAILED_STANDS+="$s "
-                    continue
-                fi
-                pvesh delete /pools/$pool_name >/dev/null 2>&1
-                if [ -n "$vmids" ]; then
-                    local base_id
-                    for base_id in $(echo "$vmids" | awk '{print int($1 / 100) * 100}' | sort -un); do
-                        for i in {1..10}; do pvesh delete /nodes/$NODE/network/vmbr$((base_id + i)) >/dev/null 2>&1; done
-                    done
-                    NET_RELOAD=1
-                fi
-
-                local mod_lower=$(echo "$MOD_TYPE" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
-                pveum user delete "${mod_lower}-s${s}@pve" >/dev/null 2>&1
-                # строки этого стенда в таблицах доступа больше не нужны
-                sed -i "/^Стенд $s ($MOD_TYPE),/d" "$CSV_FILE" "$ROT_FILE" 2>/dev/null
-                echo -e "    ${C_GREEN}✔ Стенд $s удалён: машины, пул, мосты, учётная запись${C_NC}"
-            fi
         done
     done
-
-    if [ "$ACTION" == "destroy" ]; then
-        # сетевую конфигурацию применяем один раз — после удаления всех стендов
-        [ "${NET_RELOAD:-0}" = "1" ] && pvesh set /nodes/$NODE/network >/dev/null 2>&1
-        [ -n "$DESTROY_FAILED_STANDS" ] && echo -e "\n${C_RED}✖ Не удалены полностью стенды: $DESTROY_FAILED_STANDS${C_NC}"
-    fi
 
     if [ "$ACTION" == "resources" ]; then
         echo -e "\n${C_YELLOW}Включённые машины получат новые значения после выключения и включения (не перезагрузки изнутри гостя).${C_NC}"
@@ -911,6 +1113,7 @@ manage_state() {
     elif [ "$ACTION" == "addrchk" ]; then
         check_wan_addresses "${ADDR_REPAIR:-0}"
     fi
+    return "$failed"
 }
 
 # Настройка APT на одной ВМ одним вызовом гостевого агента (раньше — пять вызовов подряд).
@@ -1404,14 +1607,28 @@ esac
 export CSV_FILE="credentials/deploy_${MOD_SHORT}.csv"
 export ROT_FILE="credentials/${ROTATION_NAME}.csv"
 
+# Один процесс на узел: защищает выбор ID и изменения сети от второго запуска оркестратора.
+case "$COMMAND:${ACTION:-}" in
+    deploy:*|redeploy:*|manage:destroy|manage:start)
+        if [[ "$COMMAND" == deploy || "$COMMAND" == redeploy ]]; then
+            if [[ ! "$WAN_BR" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}$ ]] || ! ip link show dev "$WAN_BR" >/dev/null 2>&1; then
+                echo "✖ WAN-интерфейс '$WAN_BR' не найден на узле $NODE." >&2; exit 1
+            fi
+        fi
+        if [[ ! "$MOD_TYPE" =~ ^(DEMO|REG|MOD|GOLD)_[A-Z0-9_]+$ ]]; then
+            echo "✖ Недопустимое имя модуля." >&2; exit 1
+        fi
+        exec 9>/run/lock/spetsnaz-deploy.lock || exit 1
+        flock -n 9 || { echo "✖ Другая операция со стендами уже выполняется." >&2; exit 1; }
+        ;;
+esac
+
 case $COMMAND in
     deploy)
         [ ! -d "$IMG_DIR" ] && echo -e "${C_RED}✖ Ошибка: Директория $IMG_DIR не найдена!${C_NC}" && exit 1
         if [ ! -f "$CSV_FILE" ]; then
-            echo "Стенд,Логин,Пароль" > "$CSV_FILE"
-            chmod 600 "$CSV_FILE" 2>/dev/null
+            (umask 077; printf 'Стенд,Логин,Пароль\n' > "$CSV_FILE") || exit 1
         fi
-        setup_pve_roles
 
         echo -e "ИТ-СПЕЦНАЗ, версия скриптов: $SPETSNAZ_VERSION"
         IFS='|' read -r IMG_SRC_DIR IMG_SRC_DEPTH IMG_SRC_KIND <<< "$(resolve_img_dir)"
@@ -1437,26 +1654,26 @@ case $COMMAND in
                 ;;
         esac
 
-        DEPLOY_SKIPPED=0; ISO_MISSING=0
+        ISO_MISSING=0
         ISO_SPEC_NAME=$(iso_spec); ISO_SPEC_NAME=${ISO_SPEC_NAME%%|*}
         if [ -n "$ISO_SPEC_NAME" ] && ! find_iso "$ISO_SPEC_NAME" >/dev/null; then
             echo -e "${C_YELLOW}⚠ Диск с дополнительными материалами $ISO_SPEC_NAME не найден ни в одном хранилище ISO: машины будут развёрнуты без него.${C_NC}"
         fi
-        EXPANDED_STANDS=()
-        for s in $(expand_ranges "${STANDS[@]}"); do
-            EX_IDS=$(pool_vmids "${MOD_TYPE}_S${s}")
-            if [ -n "$EX_IDS" ]; then
-                echo -e "${C_RED}✖ Стенд $s ($MOD_TYPE) уже развёрнут: в пуле ${MOD_TYPE}_S${s} машин — $(echo "$EX_IDS" | wc -l) (ID $(echo "$EX_IDS" | head -n 1)…). Пропускаю.${C_NC}"
-                echo -e "${C_YELLOW}  Чтобы развернуть заново, сначала удалите стенд (☠️ Удаление полигона) или выберите другой номер.${C_NC}"
-                continue
-            fi
-            EXPANDED_STANDS+=("$s")
-        done
+        mapfile -t EXPANDED_STANDS < <(expand_ranges "${STANDS[@]}" | tr -s ' ' '\n' | sed '/^$/d' | sort -nu)
         if [ "${#EXPANDED_STANDS[@]}" -eq 0 ]; then
-            echo -e "${C_YELLOW}Новых стендов для развёртывания нет.${C_NC}"; exit 0
+            echo "✖ Укажите номера стендов." >&2; exit 1
         fi
-
-        space_check "${#EXPANDED_STANDS[@]}"; SPACE_RC=$?
+        # Оценка по полным комплектам нужна для новых стендов. Уже созданный
+        # стенд восстанавливает только недостающие ВМ и не резервирует весь объём заново.
+        POOLS=$(pool_inventory) || exit 1
+        NEW_STANDS=0
+        for s in "${EXPANDED_STANDS[@]}"; do
+            if ! jq -e --arg pool "${MOD_TYPE}_S$s" 'any(.[]; .poolid == $pool)' >/dev/null <<< "$POOLS"; then
+                NEW_STANDS=$((NEW_STANDS + 1))
+            fi
+        done
+        SPACE_RC=0
+        if [ "$NEW_STANDS" -gt 0 ]; then space_check "$NEW_STANDS"; SPACE_RC=$?; fi
         if [ "$SPACE_RC" -eq 2 ]; then
             if [ "${SPACE_FORCE:-0}" = "1" ]; then
                 echo -e "${C_YELLOW}⚠ Места не хватает, но развёртывание запущено по подтверждению (FORCE). Возможны ошибки ввода-вывода (io-error) у ВМ.${C_NC}"
@@ -1467,27 +1684,26 @@ case $COMMAND in
         fi
         echo
 
+        DEPLOY_OK=0 DEPLOY_FAIL=0
         for s in "${EXPANDED_STANDS[@]}"; do
-            STAND_BASE=$(get_next_free_hundred)
-            deploy_from_images "$s" "$STAND_BASE" "$MOD_TYPE"
-            read -r SU_USED SU_DECL SU_CNT < <(pool_usage "${MOD_TYPE}_S${s}")
-            echo -e "    Стенд $s занимает на дисках: $(gb "$SU_USED") ГБ (объявленный объём дисков $(gb "$SU_DECL") ГБ, ВМ: $SU_CNT)"
-            sleep 1
+            if deploy_from_images "$s"; then
+                DEPLOY_OK=$((DEPLOY_OK + 1))
+            else
+                DEPLOY_FAIL=$((DEPLOY_FAIL + 1))
+                echo "✖ Стенд $s: развёртывание не завершено." >&2
+            fi
         done
 
-        if [ "$DEPLOY_SKIPPED" -gt 0 ]; then
-            echo -e "\n${C_YELLOW}⚠ Пропущено машин из-за отсутствия образов: $DEPLOY_SKIPPED. Проверьте имена файлов в $IMG_DIR/$MOD_TYPE.${C_NC}"
-        fi
         if [ "${ISO_MISSING:-0}" -gt 0 ]; then
             echo -e "\n${C_YELLOW}⚠ Без диска с дополнительными материалами (${ISO_SPEC_NAME}) осталось машин: $ISO_MISSING.${C_NC}"
             echo -e "${C_YELLOW}  Загрузите ISO в хранилище (local → ISO Images) и подключите: Состояние и доступ → «Подключить диск с доп. материалами».${C_NC}"
         fi
-        echo -e "\n${C_GREEN}✔ Деплой ($MOD_TYPE) завершен! Доступы в $CSV_FILE${C_NC}"
-        cat "$CSV_FILE" | column -t -s ','
+        echo "Итог $MOD_TYPE: готово стендов $DEPLOY_OK, не завершено $DEPLOY_FAIL. Доступы: $CSV_FILE"
+        [ "$DEPLOY_FAIL" -eq 0 ] || exit 1
         ;;
     manage)
         echo -e "${C_GREEN}Выполняю команду $ACTION...${C_NC}"
-        manage_state "${STANDS[@]}"
+        manage_state "${STANDS[@]}" || exit 1
         echo -e "${C_GREEN}✔ Операция $ACTION завершена.${C_NC}"
         ;;
     patch)
