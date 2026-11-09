@@ -1,5 +1,5 @@
 #!/bin/bash
-SPETSNAZ_VERSION="0.7.9 (2026-10-20)"
+SPETSNAZ_VERSION="0.8.0 (2026-11-09)"
 NODE=$(hostname -s)
 
 # Параметры экспертного доступа и APT-кэша (переопределяются в spetsnaz.conf)
@@ -17,6 +17,14 @@ APT_CACHE_PORT="${APT_CACHE_PORT:-$([ "$APT_MODE" = proxy ] && echo 3128 || echo
 # разворачивают из командной строки, по умолчанию берёт образы DEMO_2.
 # Пустое значение в spetsnaz.conf (IMG_FROM_DEMO_3="") отключает замену.
 IMG_FROM_DEMO_3="${IMG_FROM_DEMO_3-DEMO_2}"
+# Внешняя сеть REG_BD — своя, не общая WAN_BR модулей ДЭ: REG_WAN_BR из spetsnaz.conf, иначе сеть SDN «Internet»
+# (как у национального эксперта), если она есть; иначе — общая WAN_BR
+if [ "${MOD_TYPE:-}" = REG_BD ]; then
+    if [ -n "${REG_WAN_BR:-}" ]; then WAN_BR="$REG_WAN_BR"
+    elif pvesh get /cluster/sdn/vnets/Internet >/dev/null 2>&1; then WAN_BR="Internet"; fi
+fi
+# REG_A (аудит) разворачивается из эталона демоэкзамена DEMO_GOLD (решение 2026-11-08: «чёрный ящик» на основе Gold_DEMO_2)
+IMG_FROM_REG_A="${IMG_FROM_REG_A-DEMO_GOLD}"
 # Дополнительные диски HQ-SRV для DEMO_2/DEMO_3 (RAID по КИМ): "ЧИСЛО:РАЗМЕР_ГБ"; пусто — не добавлять
 HQSRV_EXTRA_DISKS="${HQSRV_EXTRA_DISKS-2:1}"
 
@@ -168,12 +176,38 @@ pool_check_single() {
     return 1
 }
 
+# ===================== Раскладки модулей (0.8.0) =====================
+# Раскладка DEMO (7 ВМ) — у модулей демоэкзамена и у REG_A (аудит на основе эталона DEMO_GOLD)
+is_demo_layout() {
+    case "$MOD_TYPE" in DEMO*|REG_A) return 0 ;; *) return 1 ;; esac
+}
+# Сколько мостов создаётся на стенд
+stand_bridge_count() {
+    case "$MOD_TYPE" in REG_BD) echo 15 ;; *) echo 10 ;; esac
+}
+# Мосты стенда (смещения), которые создаются как OVS
+ovs_bridge_offsets() {
+    if is_demo_layout; then echo 3; return; fi
+    case "$MOD_TYPE" in
+        REG_BD) seq 1 15 | tr '\n' ' ' ;;   # как у национального эксперта: все мосты — OVS
+        *)      echo "9 10" ;;              # прежняя раскладка REG (финал 2026)
+    esac
+}
+# Мосты стенда (смещения) с агрегированием каналов (LACP)
+lacp_bridge_offsets() {
+    if is_demo_layout; then return; fi
+    case "$MOD_TYPE" in
+        REG_BD) echo "14 15" ;;             # PROVIDER-SW <-> PROVIDER-GW
+        *)      echo "9 10" ;;
+    esac
+}
+
 grant_net_access() {
     local pool_name=$1 user=$2 base_id i
     base_id=$(stand_base_id "$pool_name") || return 1
     setup_net_roles
     pveum acl modify /pool/$pool_name -users "$user" -roles Participant_NET >/dev/null 2>&1
-    for i in {1..10}; do
+    for i in $(seq 1 "$(stand_bridge_count)"); do
         pveum acl modify /sdn/zones/localnetwork/vmbr$((base_id + i)) -users "$user" -roles Participant_SDN >/dev/null 2>&1
     done
 }
@@ -182,19 +216,23 @@ revoke_net_access() {
     local pool_name=$1 user=$2 base_id i
     pveum acl delete /pool/$pool_name -users "$user" -roles Participant_NET >/dev/null 2>&1
     base_id=$(stand_base_id "$pool_name") || return 0
-    for i in {1..10}; do
+    for i in $(seq 1 15); do   # с запасом: у REG_BD 15 мостов, несуществующие пропускаются
         pveum acl delete /sdn/zones/localnetwork/vmbr$((base_id + i)) -users "$user" -roles Participant_SDN >/dev/null 2>&1
     done
 }
 
 ensure_ovs_flows() {
     local base_id=$1 i tries br
-    for i in 9 10; do
+    for i in $(lacp_bridge_offsets); do
         br="vmbr$((base_id + i))"
         tries=0
         until ovs-vsctl br-exists "$br" 2>/dev/null || [ $tries -ge 30 ]; do
             sleep 1; tries=$((tries + 1))
         done
+        # Кадры LACP (01:80:c2:00:00:02) мост по умолчанию не пересылает. forward-bpdu=true — как у национального
+        # эксперта (в /etc/network/interfaces задаётся при создании моста, здесь — сразу, без перезапуска сети);
+        # правило OpenFlow — запасной вариант, как в 0.7.x
+        ovs-vsctl set bridge "$br" other-config:forward-bpdu=true >/dev/null 2>&1
         ovs-ofctl add-flow "$br" "table=0, dl_dst=01:80:c2:00:00:02, actions=flood" >/dev/null 2>&1
         if ! ovs-ofctl dump-flows "$br" 2>/dev/null | grep -q "01:80:c2:00:00:02"; then
             echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: не удалось добавить правило LACP на $br. Повторите: ovs-ofctl add-flow $br \"table=0, dl_dst=01:80:c2:00:00:02, actions=flood\"${C_NC}"
@@ -206,7 +244,21 @@ ensure_ovs_flows() {
 iso_spec() {
     case "$MOD_TYPE" in
         DEMO_2|DEMO_3|DEMO_T2|DEMO_T3|DEMO_GOLD) echo "Additional_de.iso|HQ-SRV BR-SRV" ;;
+        REG_BD) # роли выбирает главный эксперт (ADDONS_ROLES; пусто — не подключать)
+                local r="${ADDONS_ROLES-DATA NODE PUB COD-ADMIN}"
+                [ -n "$r" ] && echo "addons.iso|$r" ;;
+        REG_A)  ;;                                                            # аудит: стенд DEMO_GOLD, диск не нужен
         REG_*|MOD_*|GOLD_*)                     echo "Additional_rc.iso|COD-ADMIN" ;;
+    esac
+}
+
+# Необязательный второй диск (подключает эксперт отдельным пунктом меню): «имя_ISO|роли|слот»
+# DEMO_2: первоначальный диск разработчиков с материалами Задания 3 (Кибер Бэкап и др.) — если основного
+# Additional.iso недостаточно. Имя Additional_3.iso (принимается и CyberBackup.iso), к HQ-SRV и BR-SRV, вторым приводом (ide3;
+# в гостевой ОС — sr1; основной — sr0, привод cloud-init снимается при развёртывании — drop_cloudinit).
+iso2_spec() {
+    case "$MOD_TYPE" in
+        DEMO_2|DEMO_3|DEMO_T2|DEMO_T3|DEMO_GOLD) echo "Additional_3.iso|HQ-SRV BR-SRV|ide3" ;;
     esac
 }
 
@@ -214,7 +266,7 @@ iso_spec() {
 # Для Additional_de.iso принимается и имя из КИМ — Additional.iso
 find_iso() {
     local want=$1 st name vol
-    for name in "$want" $([ "$want" = "Additional_de.iso" ] && echo "Additional.iso"); do
+    for name in "$want" $([ "$want" = "Additional_de.iso" ] && echo "Additional.iso") $([ "$want" = "addons.iso" ] && echo "Addons.iso ADDONS.iso") $([ "$want" = "Additional_3.iso" ] && echo "CyberBackup.iso"); do
         for st in local $(pvesm status --content iso 2>/dev/null | awk 'NR>1 && $1 != "local" {print $1}'); do
             vol=$(pvesm list "$st" --content iso 2>/dev/null | awk -v n="$name" 'NR>1 { v=$1; sub(/.*\//, "", v); if (v == n) { print $1; exit } }')
             [ -n "$vol" ] && { echo "$vol"; return 0; }
@@ -223,21 +275,21 @@ find_iso() {
     return 1
 }
 
-# attach_iso <vmid> <iso>: подключает диск как CD/DVD (ide2). Код: 0 — подключён; 1 — ISO не найден; 2 — ошибка/занято
+# attach_iso <vmid> <iso> [слот]: подключает диск как CD/DVD (по умолчанию ide2). Код: 0 — подключён; 1 — ISO не найден; 2 — ошибка/занято
 # ISO_MISSING считает машины, оставшиеся без диска (итог печатается в конце деплоя)
 attach_iso() {
-    local v_id=$1 iso=$2 vol out cur
+    local v_id=$1 iso=$2 slot=${3:-ide2} vol out cur
     if ! vol=$(find_iso "$iso"); then
-        echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: диск $iso$([ "$iso" = "Additional_de.iso" ] && echo " (или Additional.iso)") не найден ни в одном хранилище ISO — ВМ $v_id без диска с дополнительными материалами.${C_NC}"
+        echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: диск $iso$([ "$iso" = "Additional_de.iso" ] && echo " (или Additional.iso)") не найден ни в одном хранилище ISO — ВМ $v_id без этого диска.${C_NC}"
         ISO_MISSING=$(( ${ISO_MISSING:-0} + 1 ))
         return 1
     fi
-    cur=$(qm config "$v_id" 2>/dev/null | grep '^ide2:')
+    cur=$(qm config "$v_id" 2>/dev/null | grep "^${slot}:")
     if [ -n "$cur" ] && ! echo "$cur" | grep -q 'media=cdrom'; then
-        echo -e "    ${C_YELLOW}⚠ ВМ $v_id: ide2 занят диском, а не CD/DVD — ISO не подключён.${C_NC}"
+        echo -e "    ${C_YELLOW}⚠ ВМ $v_id: $slot занят диском, а не CD/DVD — ISO не подключён.${C_NC}"
         return 2
     fi
-    if ! out=$(qm set "$v_id" --ide2 "$vol,media=cdrom" 2>&1); then
+    if ! out=$(qm set "$v_id" --${slot} "$vol,media=cdrom" 2>&1); then
         echo -e "    ${C_YELLOW}⚠ ВМ $v_id: ISO не подключён: $(echo "$out" | tail -n 1)${C_NC}"
         return 2
     fi
@@ -351,13 +403,19 @@ role_label() {
 # Раскладка ВМ стенда: строки "смещение#роль#адаптеры". Используется деплоем и оценкой места.
 stand_vm_list() {
     local br=$1 s=$2
-    local mac_stand_byte
+    local mac_stand_byte mac_mod
     mac_stand_byte=$(printf '%02X' $((10#$s % 256)))
+    # 4-й байт MAC — свой у каждого модуля: IPAM общий для кластера и ищет запись по MAC,
+    # поэтому ISP стенда 5 DEMO_1 и ISP стенда 5 DEMO_2 не должны иметь одинаковый MAC
+    mac_mod=$(mac_mod_byte)
 
     local vms=()
-    if [[ "$MOD_TYPE" == DEMO* ]]; then
+    # Модель адаптеров EcoRouter и PROVIDER-SW в REG_BD — как у национального эксперта (e1000: LACP; порты ge0, ge1 …).
+    # REG_NIC_MODEL="" в spetsnaz.conf — оставить модель, как в образе
+    local e=""; [ -n "${REG_NIC_MODEL-e1000}" ] && e=",model=${REG_NIC_MODEL-e1000}"
+    if is_demo_layout; then
         vms=(
-            "1#ISP#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:01 net1:vmbr$((br+1)) net2:vmbr$((br+2))"
+            "1#ISP#net0:$WAN_BR,macaddr=1C:87:76:${mac_mod}:${mac_stand_byte}:01 net1:vmbr$((br+1)) net2:vmbr$((br+2))"
             "2#HQ-RTR#net0:$WAN_BR,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+3))"
             "3#BR-RTR#net0:$WAN_BR,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+4))"
             "4#BR-FW#net0:vmbr$((br+4)) net1:vmbr$((br+5))"
@@ -365,16 +423,36 @@ stand_vm_list() {
             "6#HQ-CLI#net0:vmbr$((br+3)),tag=$VLAN_2"
             "7#BR-SRV#net0:vmbr$((br+5))"
         )
+    elif [ "$MOD_TYPE" = REG_BD ]; then
+        # Региональный чемпионат 2027, модули Б и Д (один стенд на два дня). Порядок — как у национального эксперта (ВМ 100–114)
+        vms=(
+            "1#GW-CORE#net0:$WAN_BR,macaddr=1C:87:76:${mac_mod}:${mac_stand_byte}:01 net1:vmbr$((br+1)) net2:vmbr$((br+2)) net3:vmbr$((br+3))"
+            "2#GW-1#net0:$WAN_BR,link_down=1$e net1:vmbr$((br+1))$e net2:vmbr$((br+4))$e"
+            "3#GW-2#net0:$WAN_BR,link_down=1$e net1:vmbr$((br+2))$e net2:vmbr$((br+11))$e"
+            "4#GW-3#net0:$WAN_BR,link_down=1$e net1:vmbr$((br+3))$e net2:vmbr$((br+13))$e"
+            "5#PROVIDER-SW#net0:vmbr$((br+13))$e net1:vmbr$((br+14))$e net2:vmbr$((br+15))$e"
+            "6#PROVIDER-GW#net0:$WAN_BR,link_down=1$e net1:vmbr$((br+14))$e net2:vmbr$((br+15))$e"
+            "7#ZSPD-SW#net0:vmbr$((br+11)) net1:vmbr$((br+12))"
+            "8#ZSPD-FW#net0:vmbr$((br+12))"
+            "9#COD-GW#net0:$WAN_BR,link_down=1$e net1:vmbr$((br+4))$e net2:vmbr$((br+5))$e"
+            "10#COD-SW-CORE#net0:vmbr$((br+5)) net1:vmbr$((br+6)) net2:vmbr$((br+7)) net3:vmbr$((br+8)) net4:vmbr$((br+9)) net5:vmbr$((br+10))"
+            "11#COD-ADMIN#net0:vmbr$((br+6))"
+            "12#COD-SRV#net0:vmbr$((br+8))"
+            "13#DATA#net0:vmbr$((br+7))"
+            "14#PUB#net0:vmbr$((br+9))"
+            "15#NODE#net0:vmbr$((br+10))"
+        )
     else
+        # Прежняя раскладка REG (финал 2026) — для совместимости, в меню не показывается
         vms=(
             "1#PROV-GW#net0:vmbr$((br+9)) net1:vmbr$((br+10))"
             "2#PROV-SW#net0:vmbr$((br+8)) net1:vmbr$((br+9)) net2:vmbr$((br+10))"
-            "3#COD-GW#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:03,link_down=1 net1:vmbr$((br+4)) net2:vmbr$((br+5))"
-            "4#GW-1#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:04,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+4))"
-            "5#GW-2#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:05,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+6))"
-            "6#GW-3#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:06,link_down=1 net1:vmbr$((br+3)) net2:vmbr$((br+8))"
+            "3#COD-GW#net0:$WAN_BR,macaddr=1C:87:76:${mac_mod}:${mac_stand_byte}:03,link_down=1 net1:vmbr$((br+4)) net2:vmbr$((br+5))"
+            "4#GW-1#net0:$WAN_BR,macaddr=1C:87:76:${mac_mod}:${mac_stand_byte}:04,link_down=1 net1:vmbr$((br+1)) net2:vmbr$((br+4))"
+            "5#GW-2#net0:$WAN_BR,macaddr=1C:87:76:${mac_mod}:${mac_stand_byte}:05,link_down=1 net1:vmbr$((br+2)) net2:vmbr$((br+6))"
+            "6#GW-3#net0:$WAN_BR,macaddr=1C:87:76:${mac_mod}:${mac_stand_byte}:06,link_down=1 net1:vmbr$((br+3)) net2:vmbr$((br+8))"
             "7#ZSPD-FW#net0:vmbr$((br+7))"
-            "8#GW-CORE#net0:$WAN_BR,macaddr=1C:87:76:40:${mac_stand_byte}:08 net1:vmbr$((br+1)) net2:vmbr$((br+2)) net3:vmbr$((br+3))"
+            "8#GW-CORE#net0:$WAN_BR,macaddr=1C:87:76:${mac_mod}:${mac_stand_byte}:08 net1:vmbr$((br+1)) net2:vmbr$((br+2)) net3:vmbr$((br+3))"
             "9#ZSPD-SW#net0:vmbr$((br+6)) net1:vmbr$((br+7))"
             "10#COD-SRV-1#net0:vmbr$((br+5)) net1:vmbr$((br+5))"
             "11#COD-SRV-2#net0:vmbr$((br+5))"
@@ -386,15 +464,69 @@ stand_vm_list() {
     printf '%s\n' "${vms[@]}"
 }
 
+# 4-й байт MAC: свой у каждого модуля. Все значения — в диапазоне 40–4F: производитель EcoRouter
+# для адаптеров vmxnet3 требует MAC с неизменными первыми 28 битами 1C:87:76:4.
+# DEMO — как прежде (развёрнутые стенды не меняются); REG/GOLD с 0.8.0 — 48–4B (раньше 50–53, вне диапазона).
+# 4E — шаблоны (вручную), 4F — прочие модули.
+mac_mod_byte() {
+    case "$MOD_TYPE" in
+        DEMO_2|DEMO_T2) echo 40 ;;
+        DEMO_1|DEMO_T1) echo 41 ;;
+        DEMO_3|DEMO_T3) echo 42 ;;
+        DEMO_GOLD)      echo 43 ;;
+        REG_BD|REG_B|MOD_B) echo 48 ;;
+        REG_D|MOD_D)    echo 49 ;;
+        REG_A|MOD_A)    echo 4A ;;
+        GOLD_*)         echo 4B ;;
+        *)              echo 4F ;;
+    esac
+}
+
+# MAC всех адаптеров vmxnet3 машины (EcoRouter): 1C:87:76:<модуль>:<стенд>:<адаптер><машина>.
+# Старшая цифра последнего байта — номер адаптера, младшая — номер машины в стенде (1–15).
+# У net0 получается …:0N — как в прежней схеме WAN-адресов. Адаптеры других моделей не трогаются.
+vendor_macs() {
+    local vid=$1 s=$2 off line iface idx cur mac mod
+    off=$((vid % 100)); mod=$(mac_mod_byte)
+    { [ "$off" -ge 1 ] && [ "$off" -le 15 ]; } || return 0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        iface=${line%%:*}; idx=${iface#net}
+        [ "$idx" -le 15 ] || continue
+        cur=${line#*: }
+        mac=$(printf '1C:87:76:%s:%02X:%X%X' "$mod" $((10#$s % 256)) "$idx" "$off")
+        qm set "$vid" --"$iface" "$(echo "$cur" | sed -E "s/^vmxnet3=[0-9A-Fa-f:]{17}/vmxnet3=$mac/")" >/dev/null 2>&1
+    done < <(qm config "$vid" 2>/dev/null | grep -E '^net[0-9]+: vmxnet3=')
+}
+
+# Привод cloud-init (ide0, 4 МБ, метка cidata) достался образам ДЭ при сборке; cloud-init внутри выключен
+# (проверено 2026-11-09: cloud-init установлен, disabled). Привод лишний и сдвигает нумерацию:
+# с ним основной диск — /dev/sr1, без него — /dev/sr0, как в решениях разработчиков КИМ.
+# KEEP_CLOUDINIT=1 в spetsnaz.conf — оставить привод.
+drop_cloudinit() {
+    local vid=$1 k
+    [ "${KEEP_CLOUDINIT:-0}" = "1" ] && return 0
+    for k in $(qm config "$vid" 2>/dev/null | awk -F: '/^(ide|sata|scsi)[0-9]+: [^,]*cloudinit/{print $1}'); do
+        qm set "$vid" --delete "$k" >/dev/null 2>&1 && echo "      привод cloud-init ($k) снят: основной диск в машине — /dev/sr0"
+    done
+}
+
 patch_net() {
     local v_id=$1; local iface=$2; local target=$3
     local current=$(qm config $v_id | grep "^${iface}:" | sed "s/^${iface}:\s*//")
+    local new_bridge=$(echo "$target" | cut -d',' -f1)
+    local new_model=""
+    [[ "$target" =~ (^|,)model=([a-z0-9]+) ]] && new_model=${BASH_REMATCH[2]}
     if [ -z "$current" ]; then
-        echo -e "    ${C_YELLOW}⚠ ВНИМАНИЕ: В шаблоне ВМ $v_id отсутствует адаптер $iface! Сеть $target не подключена.${C_NC}" >&2
-        return
+        # Адаптера в образе нет (образ с другим числом адаптеров, например EcoRouter из ДЭ в роли с бóльшим числом портов) — добавляем.
+        # Модель — по раскладке, иначе как у net0 этой машины
+        local m=${new_model:-$(qm config $v_id | sed -n 's/^net0: \([a-z0-9]*\)=.*/\1/p')}
+        current="${m:-virtio},bridge=$new_bridge"
+        echo -e "      ${v_id}: адаптера $iface в образе нет — добавлен (${m:-virtio})"
+    elif [ -n "$new_model" ] && [[ "$current" != "$new_model="* ]]; then
+        current=$(echo "$current" | sed -E "s/^[a-z0-9]+=/$new_model=/")   # модель меняется, MAC сохраняется
     fi
 
-    local new_bridge=$(echo "$target" | cut -d',' -f1)
     local patched=$(echo "$current" | sed -E "s/bridge=[^,]+/bridge=$new_bridge/")
 
     if [[ "$target" == *"tag="* ]]; then
@@ -457,10 +589,12 @@ apply_resources() {
     fi
 }
 
-# Дополнительные диски HQ-SRV (DEMO_2/DEMO_3): добавляются, только если у машины один диск
+# Дополнительные диски: HQ-SRV (DEMO_2/DEMO_3, параметр HQSRV_EXTRA_DISKS), DATA (REG_BD, DATA_EXTRA_DISKS).
+# Добавляются, только если у машины один диск. add_extra_disks <vmid> [спецификация ЧИСЛО:РАЗМЕР_ГБ] [роль]
+DATA_EXTRA_DISKS="${DATA_EXTRA_DISKS-2:10}"
 add_extra_disks() {
-    local vid=$1 cnt size cfg first bus have need i k added=0 out
-    [[ "$HQSRV_EXTRA_DISKS" =~ ^([0-9]+):([0-9]+)$ ]] || return 0
+    local vid=$1 spec=${2:-$HQSRV_EXTRA_DISKS} who=${3:-HQ-SRV} cnt size cfg first bus have need i k added=0 out
+    [[ "$spec" =~ ^([0-9]+):([0-9]+)$ ]] || return 0
     cnt=${BASH_REMATCH[1]}; size=${BASH_REMATCH[2]}
     [ "$cnt" -gt 0 ] || return 0
     cfg=$(qm config "$vid" 2>/dev/null)
@@ -468,23 +602,50 @@ add_extra_disks() {
     [ -z "$first" ] && return 0
     have=$(echo "$cfg" | grep -E '^(scsi|virtio|sata|ide)[0-9]+: ' | grep -vc 'media=cdrom')
     if [ "$have" -gt 1 ]; then
-        echo -e "      у HQ-SRV в образе уже $have диска(ов): основной и дополнительных — $((have - 1)); новые не добавляю"
+        echo -e "      у $who в образе уже $have диска(ов): основной и дополнительных — $((have - 1)); новые не добавляю"
         return 0
     fi
     bus=$(echo "$first" | sed -E 's/^([a-z]+)[0-9]+:.*/\1/')
+    # параметры дисков — как у основного (discard, ssd, iothread): иначе fstrim внутри ВМ не освобождает место в хранилище
+    local dopts="" o
+    for o in discard=on ssd=1 iothread=1; do [[ ",$first," == *",$o,"* ]] && dopts+=",$o"; done
     need=$cnt
     for i in $(seq 0 30); do
         [ "$need" -eq 0 ] && break
         [ "$bus" = "ide" ] && [ "$i" -gt 3 ] && break
         echo "$cfg" | grep -q "^${bus}${i}: " && continue
-        if out=$(qm set "$vid" --${bus}${i} "${TARGET_STORAGE}:${size}" 2>&1); then
+        if out=$(qm set "$vid" --${bus}${i} "${TARGET_STORAGE}:${size}${dopts}" 2>&1); then
             cfg+=$'\n'"${bus}${i}: added"; need=$((need - 1)); added=$((added + 1))
         else
-            echo -e "      ${C_YELLOW}⚠ HQ-SRV: диск ${bus}${i} не добавлен: $(echo "$out" | tail -n 1)${C_NC}"; break
+            echo -e "      ${C_YELLOW}⚠ $who: диск ${bus}${i} не добавлен: $(echo "$out" | tail -n 1)${C_NC}"; break
         fi
     done
-    [ "$added" -gt 0 ] && echo -e "      HQ-SRV: добавлено дисков для RAID — $added по $size ГБ (параметр HQSRV_EXTRA_DISKS)"
+    [ "$added" -gt 0 ] && echo -e "      $who: добавлено дисков для RAID — $added по $size ГБ"
     return 0
+}
+
+# Слот образа для роли: один файл на тип машины в папке модуля. Если своего файла роли нет, берётся слот.
+#   ECOROUTER.vma.zst, IDECO.vma.zst — вендорские образы (кладёт сам пользователь: у вендора или уже имеющийся);
+#   ALT-NET, ALT-SRV, ALT-WS, ALT-PVE — чистые Альты REG_BD (Сервер 10 ГБ, Сервер 40 ГБ, Рабочая станция, Виртуализация).
+# Так набор REG_BD — 6 файлов вместо 15 одинаковых.
+role_slot() {
+    case "$1" in
+        GW-1|GW-2|GW-3|PROVIDER-GW|PROV-GW|COD-GW|HQ-RTR|BR-RTR) echo ECOROUTER ;;
+        ZSPD-FW|BR-FW) echo IDECO ;;
+        GW-CORE|PROVIDER-SW|ZSPD-SW|COD-SW-CORE) echo ALT-NET ;;
+        COD-SRV|DATA|PUB) echo ALT-SRV ;;
+        COD-ADMIN) echo ALT-WS ;;
+        NODE) echo ALT-PVE ;;
+    esac
+}
+vendor_slot() { role_slot "$@"; }
+# Образ роли: сначала свой файл роли, затем слот
+image_for_role() {
+    local name=$1 slot f
+    f=$(find_image "$name" "$(role_label "$name")") && { echo "$f"; return 0; }
+    slot=$(role_slot "$name")
+    [ -n "$slot" ] && f=$(find_image "$slot") && { echo "$f"; return 0; }
+    return 1
 }
 
 # Восстановить одну ВМ роли из образа модуля и подготовить её как при деплое:
@@ -493,7 +654,7 @@ restore_vm() {
     local vid=$1 name=$2 nets_config=$3 pool=$4 pve_tag=$5
     local vm_label full_archive_path out net_rule snap_err
     vm_label=$(role_label "$name")
-    full_archive_path=$(find_image "$name" "$vm_label")
+    full_archive_path=$(image_for_role "$name")
 
     if [ -z "$full_archive_path" ] || [ ! -f "$full_archive_path" ]; then
         local search_dir
@@ -518,13 +679,16 @@ restore_vm() {
     if [ -n "$ispec" ] && [[ " ${ispec#*|} " == *" $name "* ]]; then
         attach_iso "$vid" "${ispec%%|*}"
     fi
-    if [[ "$MOD_TYPE" == DEMO_2 || "$MOD_TYPE" == DEMO_3 || "$MOD_TYPE" == DEMO_T2 || "$MOD_TYPE" == DEMO_T3 || "$MOD_TYPE" == DEMO_GOLD ]]; then
+    if [[ "$MOD_TYPE" == DEMO_2 || "$MOD_TYPE" == DEMO_3 || "$MOD_TYPE" == DEMO_T2 || "$MOD_TYPE" == DEMO_T3 || "$MOD_TYPE" == DEMO_GOLD || "$MOD_TYPE" == REG_A ]]; then
         [ "$name" == "HQ-SRV" ] && add_extra_disks "$vid"
     fi
+    [ "$MOD_TYPE" = REG_BD ] && [ "$name" == "DATA" ] && add_extra_disks "$vid" "$DATA_EXTRA_DISKS" DATA
 
     for net_rule in $nets_config; do
         patch_net $vid "${net_rule%%:*}" "${net_rule#*:}"
     done
+    vendor_macs "$vid" "${pool##*_S}"
+    drop_cloudinit "$vid"
 
     qm set $vid --tags "$pve_tag" >/dev/null 2>&1
     pvesh set /pools/$pool -vms $vid >/dev/null 2>&1
@@ -596,12 +760,14 @@ deploy_from_images() {
     echo "Стенд $s ($suffix),$USER,$PASS" >> "$CSV_FILE"
     chmod 600 "$CSV_FILE" 2>/dev/null
 
-    for i in {1..10}; do
+    local ovs_list=" $(ovs_bridge_offsets) " lacp_list=" $(lacp_bridge_offsets) "
+    for i in $(seq 1 "$(stand_bridge_count)"); do
         local bridge="vmbr$((br+i))"
-        local is_ovs=0
+        local is_ovs=0 ovs_opt=()
 
-        if [[ "$MOD_TYPE" == REG_* || "$MOD_TYPE" == MOD_* || "$MOD_TYPE" == GOLD_* ]] && [[ "$i" -ge 9 && "$i" -le 10 ]]; then is_ovs=1; fi
-        if [[ "$MOD_TYPE" == DEMO* ]] && [ "$i" -eq 3 ]; then is_ovs=1; fi
+        [[ "$ovs_list" == *" $i "* ]] && is_ovs=1
+        # LACP: forward-bpdu постоянно, в /etc/network/interfaces (ovs_options моста) — как у национального эксперта
+        [[ "$lacp_list" == *" $i "* ]] && ovs_opt=(--ovs_options "other-config:forward-bpdu=true")
 
         if pvesh get /nodes/$NODE/network/$bridge >/dev/null 2>&1; then
             local bridge_type=$(pvesh get /nodes/$NODE/network/$bridge --output-format json | grep -Po '"type":"\K[^"]+')
@@ -612,7 +778,8 @@ deploy_from_images() {
 
         if ! pvesh get /nodes/$NODE/network/$bridge >/dev/null 2>&1; then
             if [ "$is_ovs" -eq 1 ]; then
-                pvesh create /nodes/$NODE/network --iface $bridge --type OVSBridge --autostart 1 >/dev/null 2>&1
+                pvesh create /nodes/$NODE/network --iface $bridge --type OVSBridge --autostart 1 "${ovs_opt[@]}" >/dev/null 2>&1 \
+                    || pvesh create /nodes/$NODE/network --iface $bridge --type OVSBridge --autostart 1 >/dev/null 2>&1
             else
                 pvesh create /nodes/$NODE/network --iface $bridge --type bridge --autostart 1 >/dev/null 2>&1
             fi
@@ -621,9 +788,7 @@ deploy_from_images() {
 
     pvesh set /nodes/$NODE/network >/dev/null 2>&1
 
-    if [[ "$MOD_TYPE" == REG_* || "$MOD_TYPE" == MOD_* || "$MOD_TYPE" == GOLD_* ]]; then
-        ensure_ovs_flows "$br"
-    fi
+    [ -n "$(lacp_bridge_offsets)" ] && ensure_ovs_flows "$br"
 
     local vms=()
     mapfile -t vms < <(stand_vm_list "$br" "$s")
@@ -766,17 +931,18 @@ manage_state() {
                 done
                 continue
             fi
-            if [ "$ACTION" == "iso" ]; then
-                local ivid iname irole ispec2 irc
-                ispec2=$(iso_spec)
+            if [ "$ACTION" == "iso" ] || [ "$ACTION" == "iso2" ]; then
+                local ivid iname irole ispec2 irc islot iroles
+                if [ "$ACTION" == "iso2" ]; then ispec2=$(iso2_spec); else ispec2=$(iso_spec); fi
+                IFS='|' read -r _ iroles islot <<< "$ispec2"; islot=${islot:-ide2}
                 echo -e "  Стенд $s ($pool_name):"
                 for ivid in $(pvesh get /pools/$pool_name --output-format json 2>/dev/null | grep -Po '"vmid":\K\d+' | sort -n); do
                     iname=$(qm config "$ivid" 2>/dev/null | awk '/^name:/{print $2; exit}')
                     irole=$(label_role "$iname")
-                    [[ " ${ispec2#*|} " == *" $irole "* ]] || continue
-                    attach_iso "$ivid" "${ispec2%%|*}"; irc=$?
+                    [[ " $iroles " == *" $irole "* ]] || continue
+                    attach_iso "$ivid" "${ispec2%%|*}" "$islot"; irc=$?
                     if [ "$irc" -eq 0 ]; then
-                        if qm status "$ivid" 2>/dev/null | grep -q running && ! qm config "$ivid" --current 1 2>/dev/null | grep -q "^ide2: ${ISO_ATTACHED_VOL},"; then
+                        if qm status "$ivid" 2>/dev/null | grep -q running && ! qm config "$ivid" --current 1 2>/dev/null | grep -q "^${islot}: ${ISO_ATTACHED_VOL},"; then
                             echo -e "    ✔ $iname ($ivid): $ISO_ATTACHED_VOL — подключится после выключения и включения машины"
                         else
                             echo -e "    ✔ $iname ($ivid): подключён $ISO_ATTACHED_VOL"
@@ -806,7 +972,7 @@ manage_state() {
             fi
 
             if [ "$ACTION" == "start" ] && [ -n "$vmids" ]; then
-                if [[ "$MOD_TYPE" == REG_* || "$MOD_TYPE" == MOD_* || "$MOD_TYPE" == GOLD_* ]]; then
+                if [ -n "$(lacp_bridge_offsets)" ]; then
                     local ovs_base=$(stand_base_id "$pool_name")
                     [ -n "$ovs_base" ] && ensure_ovs_flows "$ovs_base"
                 fi
@@ -864,7 +1030,7 @@ manage_state() {
                 if [ -n "$vmids" ]; then
                     local base_id
                     for base_id in $(echo "$vmids" | awk '{print int($1 / 100) * 100}' | sort -un); do
-                        for i in {1..10}; do pvesh delete /nodes/$NODE/network/vmbr$((base_id + i)) >/dev/null 2>&1; done
+                        for i in $(seq 1 15); do pvesh delete /nodes/$NODE/network/vmbr$((base_id + i)) >/dev/null 2>&1; done
                     done
                     NET_RELOAD=1
                 fi
@@ -889,7 +1055,7 @@ manage_state() {
         echo -e "${C_YELLOW}Откат к снапшоту, сделанному раньше, вернёт прежние память и ядра.${C_NC}"
     fi
 
-    if [ "$ACTION" == "iso" ]; then
+    if [ "$ACTION" == "iso" ] || [ "$ACTION" == "iso2" ]; then
         echo -e "\nИтог: диск подключён к ${ISO_DONE:-0} ВМ, не подключён — ${ISO_FAIL:-0}."
         echo -e "${C_YELLOW}Снапшоты, сделанные раньше (в том числе Day0), хранят прежнюю настройку: после отката к ним диск придётся подключить снова.${C_NC}"
     fi
@@ -950,11 +1116,16 @@ post_flight_patch() {
             IP_OFFSET=50;  SECRET_TARGET="ISP";     APT_TARGETS="ISP|HQ-SRV|HQ-CLI|BR-SRV" ;;
         DEMO_3|DEMO_T3|DEMO_GOLD)
             IP_OFFSET=70;  SECRET_TARGET="ISP";     APT_TARGETS="ISP|HQ-SRV|HQ-CLI|BR-SRV" ;;
+        REG_BD)
+            IP_OFFSET=100; SECRET_TARGET="GW-CORE"; APT_TARGETS="GW-CORE|PROVIDER-SW|ZSPD-SW|COD-SW-CORE|COD-ADMIN|COD-SRV|DATA|PUB|NODE" ;;
+        REG_A)
+            # аудит на основе эталона DEMO_GOLD — раскладка и роли DEMO
+            IP_OFFSET=140; SECRET_TARGET="ISP";     APT_TARGETS="ISP|HQ-SRV|HQ-CLI|BR-SRV" ;;
         REG_B|MOD_B)
             IP_OFFSET=100; SECRET_TARGET="GW-CORE"; APT_TARGETS="GW-CORE|COD-SRV-1|COD-SRV-2|PUB|COD-ADMIN|DATA" ;;
         REG_D|MOD_D)
             IP_OFFSET=120; SECRET_TARGET="GW-CORE"; APT_TARGETS="GW-CORE|COD-SRV-1|COD-SRV-2|PUB|COD-ADMIN|DATA" ;;
-        REG_A|MOD_A)
+        MOD_A)
             IP_OFFSET=140; SECRET_TARGET="GW-CORE"; APT_TARGETS="GW-CORE|COD-SRV-1|COD-SRV-2|PUB|COD-ADMIN|DATA" ;;
         *)
             IP_OFFSET=200; SECRET_TARGET="ISP";     APT_TARGETS="ISP|HQ-SRV|HQ-CLI|BR-SRV" ;;
@@ -1102,7 +1273,7 @@ stand_estimate() {
     while IFS='#' read -r off name nets; do
         [ -z "$name" ] && continue
         total=$((total + 1))
-        f=$(find_image "$name" "$(role_label "$name")" 2>/dev/null) || continue
+        f=$(image_for_role "$name" 2>/dev/null) || continue
         [ -f "$f" ] || continue
         read -r d r < <(archive_sizes "$f")
         decl=$((decl + d)); data=$((data + r)); found=$((found + 1))
@@ -1169,6 +1340,72 @@ storage_fit_list() {
 
 # Проверка перед деплоем N стендов на TARGET_STORAGE.
 # Код: 0 — места хватает; 1 — хватает, но есть предупреждения; 2 — не хватает (деплой не выполняется)
+# Память ВМ из образа (МБ): строка memory: в конфигурации внутри архива; RES_<РОЛЬ> при RES_APPLY=1 — важнее
+image_mem_mb() {
+    local f=$1 role=$2 spec m
+    if [ "${RES_APPLY:-0}" = "1" ]; then
+        spec=$(res_for_role "$role")
+        [[ "$spec" =~ ^([0-9]+):[0-9]+$ ]] && { echo "${BASH_REMATCH[1]}"; return; }
+    fi
+    m=$(zstdcat "$f" 2>/dev/null | head -c 1048576 | tr -c '[:print:]\n' '\n' | grep -m1 -oP '^memory: \K[0-9]+')
+    echo "${m:-512}"
+}
+
+# Откуда собран слот: строка «ITS-SLOT <слот> src=<ID> name=<шаблон> kind=<train|official> date=…»
+# в описании ВМ внутри архива (её пишет reg-slots.sh). Печатает понятную строку или ничего.
+slot_origin() {
+    local l src nm kind dt
+    l=$(zstdcat "$1" 2>/dev/null | head -c 1048576 | tr -c '[:print:]\n' '\n' | grep -m1 -oP '^#\s*ITS-SLOT .*' | sed 's/%20/ /g')
+    [ -n "$l" ] || return 0
+    src=$(grep -oP 'src=\K\S+' <<< "$l"); nm=$(grep -oP 'name=\K\S+' <<< "$l")
+    kind=$(grep -oP 'kind=\K\S+' <<< "$l"); dt=$(grep -oP 'date=\K\S+' <<< "$l")
+    case "$kind" in
+        train)    kind="ТРЕНИРОВОЧНЫЙ (образ ДЭ, не соответствует заданию РЧ)" ;;
+        official) kind="по заданию" ;;
+        *)        kind="" ;;
+    esac
+    echo "шаблон ${src:-?} ${nm:-}${dt:+, собран $dt}${kind:+ — $kind}"
+}
+
+# Перед деплоем: какие вендорские образы будут использованы (тренировочные или по заданию)
+vendor_slots_info() {
+    local seen="" off name nets slot f o
+    while IFS='#' read -r off name nets; do
+        [ -z "$name" ] && continue
+        slot=$(role_slot "$name")
+        case "$slot" in ECOROUTER|IDECO) ;; *) continue ;; esac
+        [[ " $seen " == *" $slot "* ]] && continue
+        seen+=" $slot"
+        f=$(image_for_role "$name" 2>/dev/null) || continue
+        o=$(slot_origin "$f")
+        echo "  Образ $slot: ${o:-источник не записан ($(basename "$f"))}"
+    done < <(stand_vm_list 0 1)
+    [ -n "$seen" ] && echo "  (Замена на образы по заданию: Подготовка хоста → «Замена образов EcoRouter и Ideco согласно КЗ»)"
+}
+
+# Оценка ОЗУ: N стендов текущего модуля против памяти хоста. Только предупреждение — деплой не останавливает
+mem_check() {
+    local n=$1 off name nets f total=0 host_kb avail_kb host_mb avail_mb need
+    while IFS='#' read -r off name nets; do
+        [ -z "$name" ] && continue
+        f=$(image_for_role "$name" 2>/dev/null) || continue
+        total=$((total + $(image_mem_mb "$f" "$name")))
+    done < <(stand_vm_list 0 1)
+    [ "$total" -eq 0 ] && return 0
+    host_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    host_mb=$((host_kb / 1024)); avail_mb=$((avail_kb / 1024)); need=$((total * n))
+    echo "  ОЗУ: один стенд ~$((total / 1024)) ГБ, стендов $n — ~$((need / 1024)) ГБ; на узле всего $((host_mb / 1024)) ГБ, свободно сейчас $((avail_mb / 1024)) ГБ"
+    if [ "$need" -gt "$host_mb" ]; then
+        echo -e "${C_YELLOW}  ⚠ Памяти узла не хватит, чтобы запустить все стенды одновременно (развернуть можно, запускать — частями).${C_NC}"
+        echo -e "${C_YELLOW}    Уменьшить память ролей: RES_<РОЛЬ> в spetsnaz.conf (минимальные требования задания).${C_NC}"
+        return 1
+    elif [ "$need" -gt "$avail_mb" ]; then
+        echo -e "${C_YELLOW}  ⚠ Сейчас свободно меньше, чем нужно всем стендам: часть памяти занята работающими машинами.${C_NC}"
+        return 1
+    fi
+    return 0
+}
+
 space_check() {
     local n=$1 decl data found total rc=0 line id type thin avail tot pct need after kind
     read -r decl data found total < <(stand_estimate)
@@ -1177,6 +1414,8 @@ space_check() {
         echo -e "${C_YELLOW}⚠ Образы не найдены — оценить место нельзя.${C_NC}"; return 0
     fi
     echo "  Один стенд: данных ~$(gb "$data") ГБ, объявленный объём дисков $(gb "$decl") ГБ"
+    mem_check "$n" || rc=1
+    [ "$MOD_TYPE" = REG_BD ] && vendor_slots_info
 
     line=$(storage_list | grep "^${TARGET_STORAGE}|")
     if [ -z "$line" ]; then
@@ -1395,6 +1634,7 @@ case "$MOD_TYPE" in
     DEMO_GOLD)                      MOD_SHORT="DE_GOLD"; ROTATION_NAME="DE_GOLD_Exam" ;;
 
     REG_A|MOD_A)                    MOD_SHORT="REG_A"; ROTATION_NAME="Day_C1" ;;
+    REG_BD)                         MOD_SHORT="REG_BD"; ROTATION_NAME="Day_C2" ;;
     REG_B|MOD_B)                    MOD_SHORT="REG_B"; ROTATION_NAME="Day_C2" ;;
     REG_D|MOD_D)                    MOD_SHORT="REG_D"; ROTATION_NAME="Day_C3" ;;
 
@@ -1539,6 +1779,12 @@ case $COMMAND in
     isoinfo)
         # для меню: «имя_ISO|роли|volid» (volid пуст — ISO не найден); пустой вывод — модулю диск не нужен
         ISPEC=$(iso_spec)
+        [ -z "$ISPEC" ] && exit 0
+        echo "${ISPEC}|$(find_iso "${ISPEC%%|*}")"
+        ;;
+    iso2info)
+        # для меню: «имя_ISO|роли|слот|volid»; пустой вывод — модулю второй диск не предусмотрен
+        ISPEC=$(iso2_spec)
         [ -z "$ISPEC" ] && exit 0
         echo "${ISPEC}|$(find_iso "${ISPEC%%|*}")"
         ;;

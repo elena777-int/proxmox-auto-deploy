@@ -1,5 +1,5 @@
 #!/bin/bash
-MENU_VERSION="0.7.9"   # версия menu.sh; должна совпадать с версией core.sh (SPETSNAZ_VERSION)
+MENU_VERSION="0.8.0"   # версия menu.sh; должна совпадать с версией core.sh (SPETSNAZ_VERSION)
 
 if [ -z "$TMUX" ] && command -v tmux &> /dev/null; then
     tmux has-session -t it_spetsnaz 2>/dev/null
@@ -363,11 +363,13 @@ expert_net_dialog() {
 
 # Выбор зоны для НОВОЙ сети: существующая зона типа Simple или новая. Печатает ID зоны (всё остальное — в stderr/диалоги).
 sdn_choose_zone() {
-    local vnet=$1 z default_zone choice
+    local vnet=$1 z default_zone=$2 choice
     local -a zlist=() menu_args=()
     mapfile -t zlist < <(pvesh get /cluster/sdn/zones --output-format json 2>/dev/null | jq -r '.[] | select(.type == "simple") | .zone' 2>/dev/null)
-    if [[ "$vnet" == vnet* ]]; then default_zone="zone${vnet#vnet}"; else default_zone="z${vnet}"; fi
-    default_zone=$(echo "$default_zone" | cut -c1-8)
+    if [ -z "$default_zone" ]; then
+        if [[ "$vnet" == vnet* ]]; then default_zone="zone${vnet#vnet}"; else default_zone="z${vnet,,}"; fi
+        default_zone=$(echo "$default_zone" | cut -c1-8)
+    fi
 
     if [ ${#zlist[@]} -gt 0 ]; then
         for z in "${zlist[@]}"; do menu_args+=("$z" "существующая зона (тип Simple)"); done
@@ -413,6 +415,137 @@ ensure_dnsmasq() {
     return 0
 }
 
+# Подключение IPAM 'pve' к зоне, где уже есть подсети (Proxmox такое изменение запрещает).
+# Подсети всех VNet зоны сохраняются в JSON, удаляются, к зоне подключается IPAM, подсети создаются
+# заново с теми же шлюзом, SNAT и DHCP-диапазонами, SDN применяется. Мосты (VNet) не удаляются —
+# конфигурация ВМ не меняется. Вызывается только для зоны без IPAM (её IPAM заведомо пуст).
+sdn_zone_fix_ipam() {
+    local z=$1 bk vnets v id n i s cidr gw dns r rc=0 first=1
+    local -a args
+    vnets=$(pvesh get /cluster/sdn/vnets --output-format json 2>/dev/null | jq -r --arg z "$z" '.[] | select(.zone==$z) | .vnet')
+    if [ -z "$vnets" ]; then
+        pvesh set "/cluster/sdn/zones/$z" --ipam pve; return $?
+    fi
+    bk=/root/sdn-$z-subnets-$(date +%Y%m%d-%H%M%S).json
+    {
+        echo '{'
+        for v in $vnets; do
+            [ $first -eq 1 ] || echo ','
+            first=0
+            printf '"%s": ' "$v"
+            pvesh get "/cluster/sdn/vnets/$v/subnets" --output-format json
+        done
+        echo '}'
+    } > "$bk"
+    if ! jq . "$bk" >/dev/null 2>&1; then
+        echo -e "${C_RED}✖ Не удалось сохранить параметры подсетей ($bk) — ничего не изменено.${C_NC}"; return 1
+    fi
+    local list
+    list=$(jq -r 'to_entries[] | .key as $v | .value[] |
+        "  \($v): \(.cidr // (.network + "/" + (.mask|tostring)))  шлюз \(.gateway // "-")  SNAT=\(.snat // 0)  DHCP \([."dhcp-range"[]? | ."start-address" + "-" + ."end-address"] | join(","))"' "$bk")
+    if ! ui_yesno_no "ЗОНА '$z' БЕЗ IPAM" "В зоне '$z' не подключён IPAM, поэтому DHCP не выдаёт адресов ни одной машине.\nProxmox не меняет IPAM, пока в зоне есть подсети. Исправление:\n  1) параметры подсетей сохраняются в $bk;\n  2) подсети удаляются, к зоне подключается IPAM 'pve';\n  3) подсети создаются заново с теми же параметрами, SDN применяется.\nМосты и настройки ВМ не меняются.\n\n$list\n\nИсправить сейчас?" 22 90; then
+        echo -e "${C_YELLOW}Зона '$z' оставлена без IPAM — DHCP в ней работать не будет.${C_NC}"; rm -f "$bk"; return 1
+    fi
+    echo -e "\n${C_GREEN}Подключаю IPAM к зоне '$z' (копия параметров подсетей: $bk)...${C_NC}"
+    for v in $vnets; do
+        for id in $(jq -r --arg v "$v" '.[$v][] | (.id // .subnet)' "$bk"); do
+            pvesh delete "/cluster/sdn/vnets/$v/subnets/$id" >/dev/null && echo "    удалена подсеть $id" || rc=1
+        done
+    done
+    pvesh set "/cluster/sdn/zones/$z" --ipam pve || { echo -e "${C_RED}✖ IPAM не подключён — подсети создаю заново без него.${C_NC}"; rc=1; }
+    for v in $vnets; do
+        n=$(jq --arg v "$v" '.[$v] | length' "$bk")
+        for ((i = 0; i < n; i++)); do
+            s=$(jq -c --arg v "$v" ".[\$v][$i]" "$bk")
+            cidr=$(echo "$s" | jq -r '.cidr // (.network + "/" + (.mask|tostring))')
+            args=(--type subnet --subnet "$cidr")
+            gw=$(echo "$s" | jq -r '.gateway // empty'); [ -n "$gw" ] && args+=(--gateway "$gw")
+            [ "$(echo "$s" | jq -r '.snat // 0')" = 1 ] && args+=(--snat 1)
+            dns=$(echo "$s" | jq -r '.dnszoneprefix // empty'); [ -n "$dns" ] && args+=(--dnszoneprefix "$dns")
+            while IFS= read -r r; do
+                [ -n "$r" ] && args+=(--dhcp-range "$r")
+            done < <(echo "$s" | jq -r '."dhcp-range"[]? | "start-address=\(."start-address"),end-address=\(."end-address")"')
+            if pvesh create "/cluster/sdn/vnets/$v/subnets" "${args[@]}" >/dev/null; then
+                echo "    создана подсеть $cidr в $v"
+            else
+                echo -e "${C_RED}    ✖ подсеть $cidr в $v не создана. Вручную: pvesh create /cluster/sdn/vnets/$v/subnets ${args[*]}${C_NC}"; rc=1
+            fi
+        done
+    done
+    pvesh set /cluster/sdn >/dev/null 2>&1
+    if [ $rc -eq 0 ]; then
+        echo -e "${C_GREEN}✔ Зона '$z': IPAM 'pve' подключён, подсети восстановлены. Машины этих сетей перезапустите (qm stop / qm start) — Proxmox выдаст им адреса.${C_NC}"
+    else
+        echo -e "${C_RED}✖ Исправление зоны '$z' завершено с ошибками; параметры подсетей — в $bk.${C_NC}"
+    fi
+    return $rc
+}
+
+# Замена тренировочных образов EcoRouter и Ideco (REG_BD) на указанные в конкурсном задании.
+# Эксперт заранее устанавливает образы из КЗ и делает из каждой машины шаблон Proxmox.
+# Для каждого выбранного шаблона: полный клон во временный ID -> vzdump -> zstd -> слот
+# <IMG_DIR>/REG_BD/<СЛОТ>.vma.zst; прежний файл уходит в <IMG_DIR>/_archive/REG_BD-<дата>/.
+vendor_slots_replace() {
+    local dest="$IMG_DIR/REG_BD" arch="$IMG_DIR/_archive/REG_BD-$(date +%Y%m%d-%H%M%S)"
+    local tmp=${VENDOR_TMP_ID:-9290} st="$TARGET_STORAGE_DEFAULT" lvl="${EXPORT_ZSTD_LEVEL:-3}"
+    local -a targs=() plan=()
+    local line id nm slot pick f tpl ok=0 fail=0 node
+    node=$(hostname -s)
+    while IFS=$'\t' read -r id nm; do
+        [ -n "$id" ] && targs+=("$id" "$nm")
+    done < <(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+        | jq -r --arg n "$node" '.[] | select(.template == 1 and .node == $n and .type == "qemu") | [.vmid, .name] | @tsv' | sort -n)
+    if [ ${#targs[@]} -eq 0 ]; then
+        ui_msgbox "НЕТ ШАБЛОНОВ" "На узле $node нет шаблонов ВМ.\n\nУстановите EcoRouter и Ideco версий, указанных в конкурсном задании, проверьте вход и преобразуйте каждую машину в шаблон (ПКМ → Convert to template). Затем вернитесь в этот пункт.\n\nГде получить образы:\n  Ideco — в личном кабинете my.ideco.ru;\n  EcoRouter Pesto — заявка на edu@ecorouter.ru или форма\n  https://ecorouter.ru/education#institution" 18 76
+        return 1
+    fi
+    for slot in ECOROUTER IDECO; do
+        f="$dest/$slot.vma.zst"
+        local cur="нет файла"
+        if [ -f "$f" ]; then
+            cur=$(zstdcat "$f" 2>/dev/null | head -c 1048576 | tr -c '[:print:]\n' '\n' | grep -m1 -oP '^#\s*ITS-SLOT \K.*' | sed 's/%20/ /g')
+            cur=${cur:-источник не записан}
+            [[ "$cur" == *kind=train* ]] && cur+=" — ТРЕНИРОВОЧНЫЙ"
+        fi
+        local src_hint="образ — в личном кабинете my.ideco.ru"
+        [ "$slot" = ECOROUTER ] && src_hint="образ Pesto — заявка на edu@ecorouter.ru или https://ecorouter.ru/education#institution"
+        pick=$(ui_menu "ОБРАЗ $slot ДЛЯ REG_BD" "Сейчас: $cur\n($src_hint)\n\nВыберите шаблон $slot по конкурсному заданию (или «Не менять»):" 22 90 $(( ${#targs[@]} / 2 + 1 )) \
+            "skip" "Не менять" "${targs[@]}") || return 0
+        [ "$pick" = skip ] && continue
+        plan+=("$pick:$slot")
+    done
+    [ ${#plan[@]} -eq 0 ] && { echo -e "${C_YELLOW}Ничего не выбрано — образы не менялись.${C_NC}"; return 0; }
+    local txt=""
+    for line in "${plan[@]}"; do
+        id=${line%%:*}; slot=${line#*:}
+        txt+="  $slot ← шаблон $id ($(qm config "$id" 2>/dev/null | awk '/^name:/{print $2}'))\n"
+    done
+    if qm config "$tmp" >/dev/null 2>&1; then
+        ui_msgbox "ВРЕМЕННЫЙ ID ЗАНЯТ" "Для сборки нужен свободный ID $tmp (ВМ с таким номером уже есть).\nУкажите другой в spetsnaz.conf: VENDOR_TMP_ID=..." 10 70; return 1
+    fi
+    ui_yesno "ЗАМЕНА ОБРАЗОВ ПО КЗ" "Будут собраны образы:\n$txt\nПрежние файлы будут перенесены в\n  $arch\nВременный клон: ID $tmp на $st (удаляется после сборки).\nУже развёрнутые стенды не меняются — новые образы используются при следующем развёртывании.\n\nПродолжить?" 18 86 || return 0
+    mkdir -p "$dest" || return 1
+    for line in "${plan[@]}"; do
+        id=${line%%:*}; slot=${line#*:}; f="$dest/$slot.vma.zst"
+        tpl=$(qm config "$id" | awk '/^name:/{print $2}')
+        echo -e "\n${C_GREEN}== $slot из шаблона $id ($tpl)${C_NC}"
+        if ! qm clone "$id" "$tmp" --name "$slot" --full 1 --storage "$st" >/dev/null 2>&1; then
+            echo -e "${C_RED}   ✖ клонирование не удалось (хранилище $st?)${C_NC}"; fail=$((fail + 1)); continue
+        fi
+        qm set "$tmp" --description "ITS-SLOT $slot src=$id name=$tpl kind=official date=$(date +%F)" >/dev/null 2>&1
+        if ( set -o pipefail; vzdump "$tmp" --mode stop --stdout 2>/dev/null | zstd -q -T0 "-$lvl" -o "$f.part" ); then
+            if [ -f "$f" ]; then mkdir -p "$arch" && mv -f "$f" "$arch/"; fi
+            mv -f "$f.part" "$f"
+            echo -e "${C_GREEN}   ✔ $slot.vma.zst — $(du -h "$f" | cut -f1)${C_NC}"; ok=$((ok + 1))
+        else
+            rm -f "$f.part"; echo -e "${C_RED}   ✖ vzdump не удался — прежний образ $slot оставлен${C_NC}"; fail=$((fail + 1))
+        fi
+        qm destroy "$tmp" --purge 1 >/dev/null 2>&1
+    done
+    echo -e "\nГотово: заменено $ok, ошибок $fail."
+    [ -d "$arch" ] && echo "Прежние образы: $arch"
+}
+
 provision_sdn_nat_dhcp() {
     local net_id cidr gw range_start range_end snat_flag node net_base ok
     local subnet_id zone_exists vnet_exists subnet_exists existing_nodes mode
@@ -420,11 +553,22 @@ provision_sdn_nat_dhcp() {
 
     node=$(hostname -s)
 
+    # Заготовка: сеть по заданию регионального чемпионата (как у национального эксперта) или своя
+    local preset d_net="vnet100" d_cidr="10.250.100.0/24" d_gw="" d_zone=""
+    preset=$(ui_menu "СЕТЬ С ВЫХОДОМ В ИНТЕРНЕТ (NAT + DHCP)" "Выберите заготовку. Все значения можно будет поправить на следующих шагах." 13 80 2 \
+        "reg" "По заданию РЧ: Internet, 100.100.100.0/24, шлюз .100, SNAT, DHCP .10–.200" \
+        "own" "Своя сеть")
+    [ -z "$preset" ] && return 0
+    if [ "$preset" = reg ]; then
+        d_net="Internet"; d_cidr="100.100.100.0/24"; d_gw="100.100.100.100"
+        d_zone="regchamp"
+    fi
+
     while true; do
-        net_id=$(ui_inputbox "СОЗДАНИЕ/ОБНОВЛЕНИЕ СЕТИ: ИМЯ СЕТИ (VNet)" "Имя сети (VNet): оно же имя моста, к которому подключаются машины (его же указывают как WAN-мост в настройках). Латиница в нижнем регистре, до 8 символов, начинается с буквы.\n\nЕсли такая сеть уже есть в кластере — мастер предложит обновить её или оставить как есть, а не упадёт с ошибкой:" 14 74 "vnet100")
+        net_id=$(ui_inputbox "СОЗДАНИЕ/ОБНОВЛЕНИЕ СЕТИ: ИМЯ СЕТИ (VNet)" "Имя сети (VNet): оно же имя моста, к которому подключаются машины (его же указывают как WAN-мост в настройках). Латинские буквы и цифры, до 8 символов, начинается с буквы (у национального эксперта — Internet).\n\nЕсли такая сеть уже есть в кластере — мастер предложит обновить её или оставить как есть, а не упадёт с ошибкой:" 14 74 "$d_net")
         [ -z "$net_id" ] && return 0
-        [[ "$net_id" =~ ^[a-z][a-z0-9]{0,7}$ ]] && break
-        ui_msgbox "НЕВЕРНЫЙ ID" "ID должен начинаться с буквы, содержать только строчные латинские буквы/цифры, не длиннее 8 символов. Попробуйте снова." 10 70
+        [[ "$net_id" =~ ^[A-Za-z][A-Za-z0-9]{0,7}$ ]] && break
+        ui_msgbox "НЕВЕРНЫЙ ID" "ID должен начинаться с буквы, содержать только латинские буквы/цифры, не длиннее 8 символов. Попробуйте снова." 10 70
     done
 
     ensure_dnsmasq
@@ -437,16 +581,17 @@ provision_sdn_nat_dhcp() {
         zone_name=$(sdn_vnet_zone "$net_id")
         [ -z "$zone_name" ] && zone_name="$net_id"
     else
-        zone_name=$(sdn_choose_zone "$net_id") || return 0
+        zone_name=$(sdn_choose_zone "$net_id" "$d_zone") || return 0
         [ -z "$zone_name" ] && return 0
     fi
 
-    cidr=$(ui_inputbox "СЕТЬ (CIDR)" "Адрес подсети для '$net_id', например 10.250.100.0/24:" 10 70 "10.250.100.0/24")
+    cidr=$(ui_inputbox "СЕТЬ (CIDR)" "Адрес подсети для '$net_id', например 10.250.100.0/24:" 10 70 "$d_cidr")
     [ -z "$cidr" ] && return 0
 
     net_base=$(echo "$cidr" | cut -d'/' -f1 | awk -F. '{print $1"."$2"."$3}')
 
-    gw=$(ui_inputbox "ШЛЮЗ" "Адрес шлюза для сети $cidr:" 10 70 "${net_base}.1")
+    [ "$cidr" = "$d_cidr" ] || d_gw=""
+    gw=$(ui_inputbox "ШЛЮЗ" "Адрес шлюза для сети $cidr:" 10 70 "${d_gw:-${net_base}.1}")
     [ -z "$gw" ] && return 0
 
     range_start=$(ui_inputbox "DHCP: начало диапазона" "Первый адрес, выдаваемый по DHCP:" 10 70 "${net_base}.10")
@@ -513,6 +658,14 @@ provision_sdn_nat_dhcp() {
                 pvesh set "/cluster/sdn/zones/$zone_name" --dhcp dnsmasq || ok=false
             fi
         fi
+        # Без IPAM 'pve' dnsmasq работает в режиме static и не знает ни одного MAC: адреса не получит никто,
+        # а регистрация в IPAM «проходит» без записи. Зоны, созданные через API без --ipam, IPAM не имеют.
+        if [ -z "$(pvesh get "/cluster/sdn/zones/$zone_name" --output-format json 2>/dev/null | jq -r '.ipam // empty')" ]; then
+            echo -e "${C_YELLOW}В зоне '$zone_name' не подключён IPAM — подключаю 'pve' (без него DHCP не выдаёт адресов).${C_NC}"
+            if ! pvesh set "/cluster/sdn/zones/$zone_name" --ipam pve 2>/dev/null; then
+                sdn_zone_fix_ipam "$zone_name" || ok=false
+            fi
+        fi
     fi
 
     clear
@@ -538,7 +691,7 @@ provision_sdn_nat_dhcp() {
         create)
             if [ "$zone_exists" -eq 0 ]; then
                 echo -e "\n${C_GREEN}Создаю зону '$zone_name'...${C_NC}"
-                pvesh create /cluster/sdn/zones --zone "$zone_name" --type simple --dhcp dnsmasq --nodes "$node" || ok=false
+                pvesh create /cluster/sdn/zones --zone "$zone_name" --type simple --ipam pve --dhcp dnsmasq --nodes "$node" || ok=false
             else
                 echo -e "\n${C_GREEN}Зона '$zone_name' уже есть — использую её.${C_NC}"
             fi
@@ -966,6 +1119,25 @@ if [ -f "$CONFIG_FILE" ] && ! grep -q 'Память и ядра машин ст�
 fi
 
 # Включить минимальные значения RES_* (раскомментировать или дописать строки; заданные вручную не трогаются)
+# REG_BD: к каким машинам подключать addons.iso — решает главный эксперт (модуль Б).
+# В модуле Д участник внутри NODE сам подключает диск, куда ему нужно. Результат — ADDONS_ROLES (экспорт)
+addons_roles_dialog() {
+    [ "$MOD_TYPE" = REG_BD ] || return 0
+    local roles all r bad=""
+    mapfile -t all < <(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT roles 2>/dev/null)
+    roles="${ADDONS_ROLES:-DATA NODE PUB COD-ADMIN}"
+    while true; do
+        roles=$(ui_inputbox "ДИСК addons.iso: МАШИНЫ" "К каким машинам стенда подключить addons.iso? Впишите имена машин через пробел (регистр не важен).\n\nПо заданию диск нужен: DATA (Кибер Бэкап), NODE (образ для SRV1/SRV2, docker-образы, dump.sql), PUB (GitFlic), COD-ADMIN.\nПусто — не подключать ни к одной.\n\nИмена машин стенда: ${all[*]}" 17 80 "$roles") || return 1
+        roles=${roles^^}; roles=${roles//,/ }
+        bad=""
+        for r in $roles; do printf '%s\n' "${all[@]}" | grep -qx "$r" || bad+="$r "; done
+        [ -z "$bad" ] && break
+        ui_msgbox "ДИСК addons.iso" "Нет таких машин в модуле $MOD_TYPE: $bad\nИсправьте список." 9 70
+    done
+    ADDONS_ROLES=$(echo $roles); export ADDONS_ROLES
+    return 0
+}
+
 res_activate_defaults() {
     local kv k
     for kv in "${SPZ_RES_DEFAULTS[@]}"; do
@@ -1032,10 +1204,11 @@ while true; do
             "addrchk"  "🔍 Проверить, получили ли адрес внешние интерфейсы")
             ;;
         state)
-            ACTION=$(ui_menu "СОСТОЯНИЕ И ДОСТУП" "Выберите операцию:" 23 80 12 \
+            ACTION=$(ui_menu "СОСТОЯНИЕ И ДОСТУП" "Выберите операцию:" 24 80 13 \
             "space"      "💽 Место, занятое стендами (и свободное на хранилищах)" \
             "resources"  "🧮 Память/ядра из spetsnaz.conf → развёрнутые стенды" \
             "iso"        "📀 Подключить диск с доп. материалами (ISO)" \
+            "iso2"       "💿 Подключить второй диск — Задание 3 (по решению эксперта)" \
             "snapshot"   "📷 Создать НОВЫЙ снапшот (Task1, Check2 и т.п.)" \
             "rollback"   "⏪ Откат к снапшоту, напр. Day0 (Внимание!)" \
             "delsnap"    "🗑️ Удалить конкретный снапшот" \
@@ -1097,12 +1270,13 @@ while true; do
     fi
 
     if [ "$ACTION" == "utils" ]; then
-        UTIL_ACTION=$(ui_menu "ПОДГОТОВКА ХОСТА PVE (ОС: $HOST_OS)" "Выберите действие:" 22 75 10 \
+        UTIL_ACTION=$(ui_menu "ПОДГОТОВКА ХОСТА PVE (ОС: $HOST_OS)" "Выберите действие:" 23 78 11 \
             "fix_repo" "1️⃣ Отключить PVE-Enterprise (Починить apt)" \
             "deps"     "2️⃣ Установить базу: OVS, jq, expect, zstd, dnsmasq" \
             "sdn_net"  "5️⃣ Создать NAT+DHCP сеть (SDN Zone/VNet/Firewall)" \
             "retag"    "6️⃣ Перевесить метки Модуль/Стенд на уже развёрнутых ВМ" \
             "ipam_reg" "7️⃣ Авто-регистрация MAC развёрнутых ВМ в IPAM" \
+            "vendor"   "8️⃣ Замена образов EcoRouter и Ideco согласно КЗ (REG_BD)" \
             "download" "3️⃣ Скачать бэкапы шаблонов (.vma.zst) по URL" \
             "howto"    "ℹ️ СПРАВКА: Как загрузить свои образы?" \
             "aptfix"   "🆘 ПАМЯТКА: apt «Size mismatch» / кэшер" \
@@ -1153,6 +1327,9 @@ while true; do
                     echo -e "${C_YELLOW}   Проверьте точное имя пакета в вашем репозитории: apt-cache search openvswitch${C_NC}"
                     apt-get install -y $COMMON_PKGS
                 fi
+                # Общий dnsmasq.service после установки пакета включается сам и занимает порт 53 на всех адресах —
+                # тогда DHCP SDN (dnsmasq@<зона>) не запускается: «Address already in use». SDN он не нужен.
+                systemctl disable --now dnsmasq >/dev/null 2>&1 && echo -e "${C_GREEN}✔ Общая служба dnsmasq выключена (DHCP SDN использует свои экземпляры dnsmasq@<зона>).${C_NC}"
                 systemctl enable --now openvswitch-switch 2>/dev/null || systemctl enable --now openvswitch 2>/dev/null || \
                     echo -e "${C_YELLOW}⚠ Не удалось включить сервис Open vSwitch автоматически — проверьте имя юнита: systemctl list-unit-files | grep -i vswitch${C_NC}"
                 # Proxmox SDN запускает собственные экземпляры dnsmasq (по одному на зону); общий системный dnsmasq не нужен и может занимать порт 53
@@ -1181,7 +1358,10 @@ while true; do
                     continue
                 fi
 
-                SUB_DIR=$(ui_inputbox "СТРУКТУРА ХРАНЕНИЯ" "Файл: $YA_NAME ($(awk -v b="$YA_SIZE" 'BEGIN{printf "%.1f", b/1073741824}') ГБ).\nУкажите имя папки модуля (она будет создана внутри $IMG_DIR):\nНапример: DEMO_1, DEMO_2, REG_B" 12 75 "DEMO_1")
+                # имя папки по умолчанию — из имени бандла: Bundle_REG_BD.tar -> REG_BD
+                DEF_SUB=DEMO_1
+                [[ "$YA_NAME" =~ ^[Bb]undle[_-]([A-Za-z0-9_]+)\.tar$ ]] && DEF_SUB=${BASH_REMATCH[1]}
+                SUB_DIR=$(ui_inputbox "СТРУКТУРА ХРАНЕНИЯ" "Файл: $YA_NAME ($(awk -v b="$YA_SIZE" 'BEGIN{printf "%.1f", b/1073741824}') ГБ).\nУкажите имя папки модуля (она будет создана внутри $IMG_DIR):\nНапример: DEMO_1, DEMO_2, REG_BD" 12 75 "$DEF_SUB")
                 [ -z "$SUB_DIR" ] && continue
                 TARGET_DIR="$IMG_DIR/$SUB_DIR"
 
@@ -1363,6 +1543,9 @@ while true; do
                 echo -e "\n${C_YELLOW}ВНИМАНИЕ:${C_NC} НЕ используйте rm -rf /var/lib/apt/lists/* — оно удалит и каталог partial."
                 echo -e "Если он уже удалён: mkdir -p /var/lib/apt/lists/partial  (затем apt-get update)."
                 ;;
+            vendor)
+                vendor_slots_replace
+                ;;
             howto)
                 ui_msgbox "ℹ️ ИНФОРМАЦИОННЫЙ БЮЛЛЕТЕНЬ" "Полигон поддерживает принцип BYOI (Bring Your Own Image).\n\nВы можете использовать собственные образы машин. Просто сделайте бэкап вашей ВМ в формате .vma.zst и положите его в директорию $IMG_DIR.\n\nКак перенести файлы без WinSCP:\n1. Загрузите их на любой веб-сервер/Яндекс.Диск и скачайте через меню 'Утилиты -> Скачать по URL (wget)'.\n2. Закиньте на USB-флешку, вставьте в сервер и скопируйте в консоли (cp /media/usb/*.zst $IMG_DIR).\n\nОбязательное условие: Имена файлов должны содержать роли (ISP, HQ-SRV, BR-RTR и т.д.)." 18 75
                 ;;
@@ -1372,14 +1555,12 @@ while true; do
         continue
     fi
 
-    MOD_TYPE=$(ui_menu "ВЫБОР ЗАДАНИЯ" "Укажите тип экзамена/модуля:" 17 75 7 \
+    MOD_TYPE=$(ui_menu "ВЫБОР ЗАДАНИЯ" "Укажите тип экзамена/модуля:" 16 80 5 \
         "DEMO_1" "Демоэкзамен: Задание 1" \
         "DEMO_2" "Демоэкзамен: Задания 2 и 3 (общий стенд)" \
         "DEMO_GOLD" "Демоэкзамен: эталон (выполненные задания, создаёт эксперт)" \
-        "REG_B"  "Рег. чемпионат: Модуль Б" \
-        "REG_D"  "Рег. чемпионат: Модуль Д" \
-        "REG_A"  "Рег. чемпионат: Модуль А" \
-        "GOLD_B" "Золотой эталон (Модуль Б)")
+        "REG_BD" "Рег. чемпионат: Модули Б и Д (один стенд на два дня)" \
+        "REG_A"  "Рег. чемпионат: Модуль А (на основе эталона DEMO_GOLD)")
 
     [ $? -ne 0 ] && continue
 
@@ -1388,7 +1569,7 @@ while true; do
 
     if [ "$ACTION" == "deploy" ]; then
 
-        if [[ "$MOD_TYPE" == DEMO* ]]; then
+        if [[ "$MOD_TYPE" == DEMO* || "$MOD_TYPE" == REG_A ]]; then
             VLAN_CONF=$(ui_inputbox "НАСТРОЙКА VLAN (DEMO)" "Введите теги VLAN через пробел (HQ_SRV HQ_CLI Management):\nПо умолчанию: 100 200 999" 10 70 "100 200 999")
             [ $? -ne 0 ] && continue
 
@@ -1474,6 +1655,7 @@ while true; do
     fi
 
     if [ "$ACTION" == "iso" ]; then
+        addons_roles_dialog || continue
         IFS='|' read -r ISO_NAME ISO_ROLES ISO_VOL <<< "$(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT isoinfo 2>/dev/null)"
         if [ -z "$ISO_NAME" ]; then
             ui_msgbox "ДИСК НЕ НУЖЕН" "Модулю $MOD_TYPE диск с дополнительными материалами не нужен (по КИМ — только для Заданий 2 и 3 и для регионального чемпионата)." 10 74
@@ -1484,6 +1666,21 @@ while true; do
             continue
         fi
         if ! ui_yesno "ПОДКЛЮЧИТЬ ДИСК" "Диск $ISO_VOL будет подключён как CD/DVD к машинам: $ISO_ROLES — на стендах [ $STANDS ].\n\n- Включённая машина получит диск сразу, если у неё уже есть привод CD/DVD; иначе — после выключения и включения.\n- Снапшоты, сделанные раньше (в том числе Day0), хранят прежнюю настройку: после отката к ним диск нужно подключить снова.\n\nПодключить?" 17 78; then
+            continue
+        fi
+    fi
+
+    if [ "$ACTION" == "iso2" ]; then
+        IFS='|' read -r ISO_NAME ISO_ROLES ISO_SLOT ISO_VOL <<< "$(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT iso2info 2>/dev/null)"
+        if [ -z "$ISO_NAME" ]; then
+            ui_msgbox "ДИСК НЕ ПРЕДУСМОТРЕН" "Для модуля $MOD_TYPE второй диск не предусмотрен. Он подключается к HQ-SRV и BR-SRV в DEMO_2 (Задания 2 и 3), если материалов основного диска недостаточно. На региональном чемпионате дистрибутив Кибер Бэкап есть в addons.iso." 11 76
+            continue
+        fi
+        if [ -z "$ISO_VOL" ]; then
+            ui_msgbox "ДИСК НЕ НАЙДЕН" "Файл $ISO_NAME (или CyberBackup.iso) не найден ни в одном хранилище ISO.\n\nЭто первоначальный диск разработчиков с материалами Задания 3 (Кибер Бэкап и др.). У разработчиков он называется так же, как основной (Additional.iso), — сохраните его под именем $ISO_NAME и загрузите: сервер → хранилище local → ISO Images → Upload, — затем повторите этот пункт." 14 80
+            continue
+        fi
+        if ! ui_yesno "ПОДКЛЮЧИТЬ ВТОРОЙ ДИСК (ЗАДАНИЕ 3)" "Диск $ISO_VOL будет подключён вторым приводом CD/DVD ($ISO_SLOT) к машинам: $ISO_ROLES — на стендах [ $STANDS ].\nОсновной диск (ide2) не затрагивается.\n\nПодключайте, если материалов основного диска для Задания 3 недостаточно (решение эксперта).\n\n- Включённая машина получит диск после выключения и включения.\n- Откат к Day0 и другим ранее сделанным снапшотам уберёт диск: подключите его снова.\n- Внутри ВМ: mount /dev/sr1 /mnt (основной диск — /dev/sr0). У стендов, развёрнутых до версии 0.8.0, остался привод cloud-init, и номера сдвинуты на один (основной — sr1, этот — sr2); проверить: lsblk -o NAME,SIZE,LABEL | grep sr.\n\nПодключить?" 20 80; then
             continue
         fi
     fi
@@ -1571,14 +1768,11 @@ while true; do
         EXPORT_ROLE=$(ui_menu "ЧТО СОХРАНИТЬ" "Стенд $STANDS ($MOD_TYPE): весь набор или одну машину?\nПри сохранении одной машины остальные образы в папке не меняются." 22 72 $(( ${#EXP_ARGS[@]} / 2 )) "${EXP_ARGS[@]}")
         [ -z "$EXPORT_ROLE" ] && continue
         [ "$EXPORT_ROLE" == "all" ] && EXPORT_ROLE=""
-        EXPORT_TARGET=$(ui_menu "КУДА СОХРАНИТЬ" "Образы будут сохранены в папку модуля внутри $IMG_DIR.\nДеплой этого модуля будет брать образы оттуда:" 19 78 8 \
+        EXPORT_TARGET=$(ui_menu "КУДА СОХРАНИТЬ" "Образы будут сохранены в папку модуля внутри $IMG_DIR.\nДеплой этого модуля будет брать образы оттуда:" 17 78 5 \
             "DEMO_1" "Демоэкзамен: Задание 1" \
             "DEMO_2" "Демоэкзамен: Задания 2 и 3 (общий стенд)" \
             "DEMO_GOLD" "Демоэкзамен: эталон (выполненные задания)" \
-            "REG_B"  "Рег. чемпионат: Модуль Б" \
-            "REG_D"  "Рег. чемпионат: Модуль Д" \
-            "REG_A"  "Рег. чемпионат: Модуль А" \
-            "GOLD_B" "Золотой эталон (Модуль Б)" \
+            "REG_BD" "Рег. чемпионат: Модули Б и Д" \
             "custom" "Своё имя папки (архив, эксперименты)")
         [ -z "$EXPORT_TARGET" ] && continue
         if [ "$EXPORT_TARGET" == "custom" ]; then
@@ -1623,6 +1817,7 @@ while true; do
     if [ "$ACTION" == "deploy" ]; then
         mapfile -t DEP_ROLES < <(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT roles 2>/dev/null)
         res_ask "${DEP_ROLES[@]}"
+        addons_roles_dialog || continue
         IFS='|' read -r ISO_NAME ISO_ROLES ISO_VOL <<< "$(MOD_TYPE="$MOD_TYPE" $CORE_SCRIPT isoinfo 2>/dev/null)"
         if [ -n "$ISO_NAME" ] && [ -z "$ISO_VOL" ]; then
             ui_yesno "НЕТ ДИСКА С ДОП. МАТЕРИАЛАМИ" "Файл $ISO_NAME$([ "$ISO_NAME" = "Additional_de.iso" ] && echo " (или Additional.iso)") не найден ни в одном хранилище ISO. Без него машины $ISO_ROLES останутся без диска с дополнительными материалами.\n\nДа — развернуть без диска (подключить позже: Состояние и доступ → «Подключить диск с доп. материалами»).\nНет — вернуться в меню: загрузите ISO (хранилище local → ISO Images → Upload) и повторите." 15 78 || continue
